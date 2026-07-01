@@ -150,7 +150,7 @@ library
                       , cardano-ledger-babbage
                       , cardano-ledger-binary >= 1.7.1
                       , cardano-ledger-byron
-                      , cardano-ledger-conway >= 1.22.1.0
+                      , cardano-ledger-conway >= 1.22.0.0
                       , cardano-ledger-core
                       , cardano-ledger-dijkstra
                       , cardano-ledger-shelley

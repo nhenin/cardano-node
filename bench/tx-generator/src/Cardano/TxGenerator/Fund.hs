@@ -85,6 +85,7 @@ getFundWitness fund = case (cardanoEra @era, fund) of
   (AlonzoEra  , Fund (InAnyCardanoEra AlonzoEra  a)) -> _fundWitness a
   (BabbageEra , Fund (InAnyCardanoEra BabbageEra a)) -> _fundWitness a
   (ConwayEra  , Fund (InAnyCardanoEra ConwayEra  a)) -> _fundWitness a
+  (DijkstraEra, Fund (InAnyCardanoEra DijkstraEra a)) -> _fundWitness a
   _                                                  -> error "getFundWitness: era mismatch"
 
 {-

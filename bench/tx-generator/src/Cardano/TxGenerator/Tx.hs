@@ -165,7 +165,19 @@ genTx :: forall era. ()
   -> TxFee era
   -> TxMetadataInEra era
   -> TxGenerator era
-genTx sbe ledgerParameters (collateral, collFunds) fee metadata inFunds outputs
+genTx sbe ledgerParameters collateral fee metadata =
+  genTxWithInclusion sbe ledgerParameters collateral fee metadata TxInclusionNone
+
+genTxWithInclusion :: forall era. ()
+  => IsShelleyBasedEra era
+  => ShelleyBasedEra era
+  -> LedgerProtocolParameters era
+  -> (TxInsCollateral era, [Fund])
+  -> TxFee era
+  -> TxMetadataInEra era
+  -> TxInclusion era
+  -> TxGenerator era
+genTxWithInclusion sbe ledgerParameters (collateral, collFunds) fee metadata inclusion inFunds outputs
   = bimap
       ApiError
       (\b -> (signShelleyTransaction (shelleyBasedEra @era) b $ map WitnessPaymentKey allKeys, getTxId b))
@@ -181,6 +193,7 @@ genTx sbe ledgerParameters (collateral, collFunds) fee metadata inFunds outputs
     & setTxValidityUpperBound (defaultTxValidityUpperBound sbe)
     & setTxMetadata metadata
     & setTxProtocolParams (BuildTxWith (Just ledgerParameters))
+    & setTxInclusion inclusion
 
 
 txSizeInBytes :: forall era. IsShelleyBasedEra era =>

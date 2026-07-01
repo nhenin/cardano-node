@@ -81,6 +81,8 @@ library
                         Cardano.TxGenerator.Fund
                         Cardano.TxGenerator.FundQueue
                         Cardano.TxGenerator.Genesis
+                        Cardano.TxGenerator.Dijkstra.ActorPolicy
+                        Cardano.TxGenerator.Dijkstra.LaneFeeder
                         Cardano.TxGenerator.ProtocolParameters
                         Cardano.TxGenerator.PureExample
                         Cardano.TxGenerator.Script.Types
@@ -177,6 +179,21 @@ executable tx-generator
                         "-with-rtsopts=-T"
 
   build-depends:        base
+                      , tx-generator
+
+executable dijkstra-lane-feeder
+  import:               project-config
+
+  hs-source-dirs:       app
+  main-is:              dijkstra-lane-feeder.hs
+
+  ghc-options:          -threaded
+                        -Wall
+                        -rtsopts
+                        "-with-rtsopts=-T"
+
+  build-depends:        base
+                      , optparse-applicative
                       , tx-generator
 
 executable calibrate-script
