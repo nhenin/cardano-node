@@ -398,7 +398,6 @@ runActorLanes
         optimisticEntry : urgentEntry : _ -> pure (optimisticEntry, urgentEntry)
         _ -> die "actor mode requires at least two entries in --funds"
     let fundsDir = takeDirectory fundsFile
-        demandSize = lfoMetadataBytes + actorTxOverheadBytes
         -- The on-chain bid is a flat, generous cap (the --fee), not the actor's
         -- economic quote: our txs form a dependent chain, so an eviction (a rising
         -- quote overtaking a per-tx bid) would break the whole chain downstream.
@@ -433,7 +432,13 @@ runActorLanes
               quotes <- readPublishedQuotes lfoQuotesFile
               config <- readActorConfig lfoActorConfig
               let actorType = sampleActorType config counter
-                  demand = sampleDemand config demandSize counter
+                  -- The cockpit can fatten every payload live (storm scenarios):
+                  -- more bytes per tx fills a lane's byte budget at the same rate.
+                  payloadBytes = maybe lfoMetadataBytes id (cfgMetadataBytes config)
+                  liveMetadata
+                    | payloadBytes == lfoMetadataBytes = metadata
+                    | otherwise = either (const metadata) id (mkMetadata @DijkstraEra payloadBytes)
+                  demand = sampleDemand config (payloadBytes + actorTxOverheadBytes) counter
                   -- The cockpit can take the wheel on the lane split (nobody
                   -- walks away then); otherwise each actor decides economically.
                   choice = case cfgLaneMix config of
@@ -452,11 +457,11 @@ runActorLanes
                     pure (optimisticLane, urgentLane)
                   BuyUrgent -> do
                     logDecision counter actorType BuyUrgent demand quotes lfoFeeLovelace generation
-                    spent <- submitOnLane connectInfo bid metadata pace urgentLane (counter, Urgent)
+                    spent <- submitOnLane connectInfo bid liveMetadata pace urgentLane (counter, Urgent)
                     pure (optimisticLane, spent)
                   BuyOptimistic -> do
                     logDecision counter actorType BuyOptimistic demand quotes lfoFeeLovelace generation
-                    spent <- submitOnLane connectInfo bid metadata pace optimisticLane (counter, Optimistic)
+                    spent <- submitOnLane connectInfo bid liveMetadata pace optimisticLane (counter, Optimistic)
                     pure (spent, urgentLane)
               step optimisticLane' urgentLane' (counter + 1)
     step optimisticChains urgentChains 1
@@ -705,6 +710,10 @@ data ActorConfig = ActorConfig
     -- ^ Live override of the lane choice: the share of demands sent optimistic
     -- (0 = all urgent, 1 = all optimistic). 'Nothing' = the actors decide
     -- economically; set, the cockpit has the wheel and nobody walks away.
+  , cfgMetadataBytes :: !(Maybe Int)
+    -- ^ Live override of the metadata payload size: fatter transactions fill a
+    -- lane's byte budget faster at the same demand rate (storm scenarios).
+    -- 'Nothing' = the CLI value.
   , cfgLabel :: !(Maybe String)
     -- ^ Cockpit command label ("generation"). Stamped on every decision log
     -- line so each tx can be tracked back to the command that caused it.
@@ -726,6 +735,7 @@ defaultActorConfig =
     , cfgFeeBuffer = 1.2
     , cfgDelayMs = Nothing
     , cfgLaneMix = Nothing
+    , cfgMetadataBytes = Nothing
     , cfgLabel = Nothing
     }
 
@@ -746,6 +756,7 @@ instance Aeson.FromJSON ActorConfig where
         <*> o Aeson..:? "feeBuffer" Aeson..!= cfgFeeBuffer defaultActorConfig
         <*> o Aeson..:? "delayMs"
         <*> o Aeson..:? "laneMix"
+        <*> o Aeson..:? "metadataBytes"
         <*> o Aeson..:? "label"
 
 -- | Read the live actor config; fall back to the default when the file is missing
