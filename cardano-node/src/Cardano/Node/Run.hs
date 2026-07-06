@@ -77,10 +77,10 @@ import           Ouroboros.Consensus.Config.SupportsNode (ConfigSupportsNode (..
 import           Ouroboros.Consensus.Node (SnapshotPolicyArgs (..),
                    NodeDatabasePaths (..), nonImmutableDbPath, RunNodeArgs (..), StdRunNodeArgs (..))
 import           Ouroboros.Consensus.Protocol.Praos.AgentClient (KESAgentClientTrace)
-import           Ouroboros.Consensus.Ledger.SupportsMempool (GenTxId)
+import           Ouroboros.Consensus.Ledger.SupportsMempool (GenTxId, MempoolLane (..), txForgetValidated, txId, txInclusionLane)
 import           Ouroboros.Consensus.Node (RunNodeArgs (..),
                    SnapshotPolicyArgs (..), StdRunNodeArgs (..))
-import qualified Ouroboros.Consensus.Node as Node (NodeDatabasePaths (..), getChainDB, run)
+import qualified Ouroboros.Consensus.Node as Node (NodeDatabasePaths (..), getChainDB, getMempool, run)
 import           Ouroboros.Consensus.Node.Genesis
 import           Ouroboros.Consensus.Node.NetworkProtocolVersion
 import           Ouroboros.Consensus.Node.ProtocolInfo
@@ -131,12 +131,12 @@ import           Ouroboros.Network.PeerSelection.State.LocalRootPeers (HotValenc
 import           Ouroboros.Network.Protocol.ChainSync.Codec
 
 import           Control.Applicative (empty)
-import           Control.Concurrent (killThread, mkWeakThreadId, myThreadId, getNumCapabilities)
+import           Control.Concurrent (forkIO, killThread, mkWeakThreadId, myThreadId, getNumCapabilities, threadDelay)
 import           Control.Concurrent.Async
 import           Control.Concurrent.Class.MonadSTM.Strict
-import           Control.Exception (try, Exception, IOException)
+import           Control.Exception (try, Exception, IOException, evaluate)
 import qualified Control.Exception as Exception
-import           Control.Monad (forM, forM_, unless, void, when, join)
+import           Control.Monad (forM, forM_, forever, unless, void, when, join)
 import           Control.Monad.Class.MonadThrow (MonadThrow (..))
 import           Control.Monad.IO.Class (MonadIO (..))
 import           Control.Monad.Trans.Except (ExceptT, runExceptT)
@@ -165,7 +165,9 @@ import           Data.Version (showVersion)
 import           Network.DNS (Resolver)
 import           Network.HostName (getHostName)
 import           Network.Socket (Socket)
-import           System.Directory (canonicalizePath, createDirectoryIfMissing, makeAbsolute)
+import           Data.Char (isSpace)
+import           System.Directory (canonicalizePath, createDirectoryIfMissing, doesFileExist,
+                   makeAbsolute, removeFile)
 import           System.Environment (lookupEnv)
 import           System.FilePath (takeDirectory, (</>))
 import           System.IO (hPutStrLn)
@@ -178,7 +180,9 @@ import           System.Posix.Types (FileMode)
 import           System.Win32.File
 #endif
 import           Paths_cardano_node (version)
-import           Ouroboros.Consensus.Mempool (MempoolTimeoutConfig(..))
+import           Ouroboros.Consensus.Mempool (Mempool (..), MempoolSnapshot (..),
+                   MempoolTimeoutConfig (..))
+import qualified Data.List.NonEmpty as NE
 import           GHC.Stack
 
 import           LeiosDemoDb (newLeiosDBInMemory, newLeiosDBSQLite)
@@ -519,6 +523,36 @@ handleSimpleNode blockType runP tracers nc networkMagic onKernel = do
                 (shutdownTracer tracers)
                 registry
                 (Node.getChainDB nodeKernel)
+
+              -- Demo control: flush one mempool lane on demand. The demo
+              -- server raises a flag file naming the lane; every waiting tx
+              -- of that lane is removed (the chain itself is untouched) and
+              -- the flag is lowered. Same idiom as the certification-miss
+              -- vote gate (LEIOS_WITHHOLD_VOTES_FILE).
+              mbFlushFile <- lookupEnv "DIJKSTRA_FLUSH_LANE_FILE"
+              forM_ mbFlushFile $ \flushFile -> forkIO $ forever $ do
+                threadDelay 2000000
+                flagged <- doesFileExist flushFile
+                when flagged $ do
+                  raw <- readFile flushFile
+                  let lane = filter (not . isSpace) raw
+                  _ <- evaluate (length lane)
+                  removeFile flushFile
+                  let wanted = case lane of
+                        "urgent"     -> Just UrgentLane
+                        "optimistic" -> Just OptimisticLane
+                        _            -> Nothing
+                  forM_ wanted $ \flushLane -> do
+                    snap <- atomically $ getSnapshot (Node.getMempool nodeKernel)
+                    let victims =
+                          [ txId tx
+                          | (vtx, _, _) <- snapshotTxs snap
+                          , let tx = txForgetValidated vtx
+                          , txInclusionLane tx == flushLane
+                          ]
+                    forM_ (NE.nonEmpty victims) $
+                      removeTxsEvenIfValid (Node.getMempool nodeKernel)
+
               onKernel nodeKernel
           , rnPeerSharing    = ncPeerSharing nc
           , rnGetUseBootstrapPeers = readTVar useBootstrapVar
