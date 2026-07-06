@@ -25,6 +25,11 @@ import Control.Monad (foldM, when)
 import qualified Data.Aeson as Aeson
 import Data.Bifunctor (first)
 import Data.Function ((&))
+import Data.List (isInfixOf, sortOn)
+import qualified Data.Map.Strict as Map
+import Data.Ord (Down (..))
+import Data.Time.Clock.POSIX (getPOSIXTime)
+import qualified Data.Set as Set
 import Data.Word (Word32)
 import System.Directory (doesFileExist, makeAbsolute)
 import System.Environment (lookupEnv)
@@ -77,6 +82,10 @@ data LaneFeederOptions = LaneFeederOptions
     -- re-anchor both chains on the funds' current UTxOs.
   , lfoInitialValue2 :: !(Maybe Integer)
     -- ^ Lovelace value of '--initial-txin-2' (required together with it).
+  , lfoFanout :: !Int
+    -- ^ Actor mode: parallel dependent chains per lane. Each lane's fund is
+    -- fanned out into this many chain heads, so one broken chain costs 1/N of
+    -- the lane's throughput instead of all of it.
   }
 
 data FundEntry = FundEntry
@@ -379,7 +388,7 @@ runActorLanes ::
   [FundEntry] ->
   IO ()
 runActorLanes
-  LaneFeederOptions{lfoMetadataBytes, lfoCycles, lfoDelayMs, lfoFeeLovelace, lfoQuotesFile, lfoActorConfig, lfoInitialTxIn, lfoInitialValue, lfoInitialTxIn2, lfoInitialValue2}
+  LaneFeederOptions{lfoMetadataBytes, lfoCycles, lfoDelayMs, lfoFeeLovelace, lfoQuotesFile, lfoActorConfig, lfoInitialTxIn, lfoInitialValue, lfoInitialTxIn2, lfoInitialValue2, lfoFanout}
   connectInfo@LocalNodeConnectInfo{localNodeNetworkId}
   metadata
   fundsFile
@@ -396,12 +405,16 @@ runActorLanes
         -- The elasticity in the demo comes from the actor walking away, not from
         -- mempool eviction.
         bid = Coin lfoFeeLovelace
-    optimisticFund0 <-
+    optimisticAnchor <-
       overrideFund lfoInitialTxIn lfoInitialValue
         =<< loadInitialFund localNodeNetworkId fundsDir optimisticEntry
-    urgentFund0 <-
+    urgentAnchor <-
       overrideFund lfoInitialTxIn2 lfoInitialValue2
         =<< loadInitialFund localNodeNetworkId fundsDir urgentEntry
+    optimisticChains <-
+      provisionLane connectInfo lfoFanout lfoFeeLovelace "optimistic" optimisticAnchor
+    urgentChains <-
+      provisionLane connectInfo lfoFanout lfoFeeLovelace "urgent" urgentAnchor
     putStrLn $
       "Actor mode: up to "
         <> show lfoCycles
@@ -409,30 +422,266 @@ runActorLanes
         <> lfoQuotesFile
         <> ", policy from "
         <> lfoActorConfig
-    let step optimisticFund urgentFund counter
+        <> ", "
+        <> show (length (laneFunds optimisticChains))
+        <> "+"
+        <> show (length (laneFunds urgentChains))
+        <> " chains"
+    let step optimisticLane urgentLane counter
           | counter > lfoCycles = pure ()
           | otherwise = do
               quotes <- readPublishedQuotes lfoQuotesFile
               config <- readActorConfig lfoActorConfig
               let actorType = sampleActorType config counter
                   demand = sampleDemand config demandSize counter
-                  choice = decide actorType (policyOf config) quotes demand
-              (optimisticFund', urgentFund') <-
+                  -- The cockpit can take the wheel on the lane split (nobody
+                  -- walks away then); otherwise each actor decides economically.
+                  choice = case cfgLaneMix config of
+                    Just mix
+                      | pseudoUnit 5 counter < mix -> BuyOptimistic
+                      | otherwise -> BuyUrgent
+                    Nothing -> decide actorType (policyOf config) quotes demand
+                  -- the dashboard can re-pace the demand live via the config
+                  pace = maybe lfoDelayMs id (cfgDelayMs config)
+                  generation = cfgLabel config
+              (optimisticLane', urgentLane') <-
                 case choice of
                   WalkAway -> do
-                    logDecision counter actorType WalkAway demand quotes 0
-                    pauseMs (max actorWalkAwayPauseMs lfoDelayMs)
-                    pure (optimisticFund, urgentFund)
+                    logDecision counter actorType WalkAway demand quotes 0 generation
+                    pauseMs (max actorWalkAwayPauseMs pace)
+                    pure (optimisticLane, urgentLane)
                   BuyUrgent -> do
-                    logDecision counter actorType BuyUrgent demand quotes lfoFeeLovelace
-                    spent <- submitLaneTx connectInfo bid metadata lfoDelayMs urgentFund (counter, Urgent)
-                    pure (optimisticFund, spent)
+                    logDecision counter actorType BuyUrgent demand quotes lfoFeeLovelace generation
+                    spent <- submitOnLane connectInfo bid metadata pace urgentLane (counter, Urgent)
+                    pure (optimisticLane, spent)
                   BuyOptimistic -> do
-                    logDecision counter actorType BuyOptimistic demand quotes lfoFeeLovelace
-                    spent <- submitLaneTx connectInfo bid metadata lfoDelayMs optimisticFund (counter, Optimistic)
-                    pure (spent, urgentFund)
-              step optimisticFund' urgentFund' (counter + 1)
-    step optimisticFund0 urgentFund0 1
+                    logDecision counter actorType BuyOptimistic demand quotes lfoFeeLovelace generation
+                    spent <- submitOnLane connectInfo bid metadata pace optimisticLane (counter, Optimistic)
+                    pure (spent, urgentLane)
+              step optimisticLane' urgentLane' (counter + 1)
+    step optimisticChains urgentChains 1
+
+-- | A lane's working set: several parallel dependent chains, spent round-robin.
+-- One broken chain is dropped and costs 1/N of the throughput; the feeder only
+-- dies (for the demo runner to re-provision) when a lane has no chain left.
+data LaneChains = LaneChains
+  { laneFunds :: ![SpendableFund]
+  , laneCursor :: !Int
+  }
+
+-- | Submit one tx on the lane's next chain. A permanent rejection (the chain
+-- head lost a first-come race, e.g. against a crashed feeder's in-flight txs)
+-- drops that chain and the lane keeps going on the others.
+submitOnLane
+  :: LocalNodeConnectInfo
+  -> Coin
+  -> TxMetadataInEra DijkstraEra
+  -> Int
+  -> LaneChains
+  -> (Int, Inclusion)
+  -> IO LaneChains
+submitOnLane connectInfo fee metadata delayMs LaneChains{laneFunds, laneCursor} (index, inclusion) = do
+  let count = length laneFunds
+      slot = laneCursor `mod` max 1 count
+      fund = laneFunds !! slot
+  outcome <- submitLaneTxCatch connectInfo fee metadata delayMs fund (index, inclusion)
+  case outcome of
+    Right next ->
+      pure LaneChains{laneFunds = replaceAt slot next laneFunds, laneCursor = slot + 1}
+    Left err -> do
+      putStrLn $
+        show index
+          <> ": chain "
+          <> show (slot + 1)
+          <> "/"
+          <> show count
+          <> " dropped ("
+          <> renderInclusion inclusion
+          <> "): "
+          <> err
+      let rest = deleteAt slot laneFunds
+      when (null rest) $
+        die $ renderInclusion inclusion <> " lane lost all its chains — restart to re-provision"
+      pure LaneChains{laneFunds = rest, laneCursor = slot}
+
+replaceAt :: Int -> a -> [a] -> [a]
+replaceAt i x xs = case splitAt i xs of
+  (before, _ : after) -> before <> (x : after)
+  _ -> xs
+
+deleteAt :: Int -> [a] -> [a]
+deleteAt i xs = case splitAt i xs of
+  (before, _ : after) -> before <> after
+  _ -> xs
+
+-- | Build a lane's working set of parallel chains. Each attempt re-discovers
+-- the UTxOs at the fund's address (a restarted feeder re-adopts the surviving
+-- chain heads, so no working capital is ever stranded) and, if the lane has
+-- fewer chains than requested, fans the largest one out. A failed fan-out is
+-- retried from a FRESH discovery: right after a restart the adopted head may
+-- still be contested by the previous feeder's in-flight txs (first-come), and
+-- the head keeps moving until that backlog drains. Fan-out outputs are spent
+-- straight from the mempool, so nothing waits to settle.
+provisionLane
+  :: LocalNodeConnectInfo
+  -> Int
+  -> Integer
+  -> String
+  -> SpendableFund
+  -> IO LaneChains
+provisionLane connectInfo fanout feeLovelace laneName anchor = attempt provisionAttempts
+ where
+  attempt :: Int -> IO LaneChains
+  attempt attemptsLeft = do
+    discovered <- discoverFunds connectInfo anchor
+    let minChain = Coin (chainFloorFeeMultiple * feeLovelace)
+        usable = take fanout (sortOn (Down . spendValue) (filter ((>= minChain) . spendValue) discovered))
+    base <- case usable of
+      [] -> do
+        putStrLn $ laneName <> " lane: no spendable UTxO discovered, using the configured anchor"
+        pure [anchor]
+      _ -> do
+        putStrLn $
+          laneName
+            <> " lane: adopted "
+            <> show (length usable)
+            <> " UTxO(s) already at the fund address"
+        pure usable
+    let missing = fanout - length base
+        settled = pure LaneChains{laneFunds = base, laneCursor = 0}
+    if missing <= 0
+      then settled
+      else case sortOn (Down . spendValue) base of
+        [] -> settled
+        biggest : rest ->
+          case buildFanoutTx connectInfo (missing + 1) biggest of
+            Left err -> do
+              putStrLn $
+                laneName <> " lane: fan-out skipped (" <> err <> "); running on " <> show (length base) <> " chain(s)"
+              settled
+            Right (splitTx, pieces) -> do
+              result <- submitTxToNodeLocal connectInfo (TxInMode ShelleyBasedEraDijkstra splitTx)
+              case result of
+                TxSubmitSuccess -> do
+                  putStrLn $
+                    laneName
+                      <> " lane: fanned the largest UTxO out into "
+                      <> show (length pieces)
+                      <> " chains ("
+                      <> show (getTxId (getTxBody splitTx))
+                      <> ")"
+                  pure LaneChains{laneFunds = pieces <> rest, laneCursor = 0}
+                failure
+                  | attemptsLeft > 1 -> do
+                      putStrLn $
+                        laneName
+                          <> " lane: fan-out attempt failed ("
+                          <> renderSubmitFailure failure
+                          <> "), re-discovering in "
+                          <> show (provisionRetryDelayMs `div` 1000)
+                          <> "s"
+                      pauseMs provisionRetryDelayMs
+                      attempt (attemptsLeft - 1)
+                  | otherwise -> do
+                      putStrLn $
+                        laneName
+                          <> " lane: fan-out gave up ("
+                          <> renderSubmitFailure failure
+                          <> "); running on "
+                          <> show (length base)
+                          <> " chain(s)"
+                      settled
+
+renderSubmitFailure :: TxSubmitResult -> String
+renderSubmitFailure = \case
+  TxSubmitSuccess -> "success"
+  TxSubmitFail err -> "rejected: " <> show err
+  TxSubmitError err -> "submit error: " <> show err
+
+-- | How many discover-then-fan-out rounds a lane tries before settling for
+-- whatever chains it has. Right after a restart the old feeder's in-flight
+-- backlog can contest the head for a few blocks.
+provisionAttempts :: Int
+provisionAttempts = 10
+
+-- | Pause between provisioning attempts, in milliseconds.
+provisionRetryDelayMs :: Int
+provisionRetryDelayMs = 5000
+
+-- | A chain head must afford a good run of txs before it is worth adopting.
+chainFloorFeeMultiple :: Integer
+chainFloorFeeMultiple = 100
+
+-- | Every UTxO currently at the fund's payment address, per the local node.
+-- The genesis pseudo-input keeps the anchor's witness; everything else is a
+-- plain payment-key spend.
+discoverFunds :: LocalNodeConnectInfo -> SpendableFund -> IO [SpendableFund]
+discoverFunds connectInfo@LocalNodeConnectInfo{localNodeNetworkId} anchor = do
+  let credential =
+        PaymentCredentialByKey $
+          verificationKeyHash $
+            getVerificationKey (spendPaymentKey anchor)
+      address = AddressShelley (makeShelleyAddress localNodeNetworkId credential NoStakeAddress)
+      query =
+        QueryInEra $
+          QueryInShelleyBasedEra ShelleyBasedEraDijkstra $
+            QueryUTxO (QueryUTxOByAddress (Set.singleton address))
+  result <- runExceptT (queryNodeLocalState connectInfo VolatileTip query)
+  case result of
+    Left failure -> do
+      putStrLn $ "fund discovery failed (acquire): " <> show failure
+      pure []
+    Right (Left mismatch) -> do
+      putStrLn $ "fund discovery failed (era): " <> show mismatch
+      pure []
+    Right (Right utxo) ->
+      pure
+        [ SpendableFund
+            { spendTxIn = txIn
+            , spendValue = txOutValueToLovelace value
+            , spendPaymentKey = spendPaymentKey anchor
+            , spendWitness =
+                if txIn == spendTxIn anchor
+                  then spendWitness anchor
+                  else SpendPayment (spendPaymentKey anchor)
+            }
+        | (txIn, TxOut _ value _ _) <- Map.toList (unUTxO utxo)
+        ]
+
+-- | Split a fund into @n@ equal chain heads at the fund's own address. Travels
+-- urgent: the RB is applied first, so the heads exist for either lane's chains.
+buildFanoutTx
+  :: LocalNodeConnectInfo
+  -> Int
+  -> SpendableFund
+  -> Either String (Tx DijkstraEra, [SpendableFund])
+buildFanoutTx LocalNodeConnectInfo{localNodeNetworkId} n SpendableFund{spendTxIn, spendValue = Coin available, spendPaymentKey, spendWitness} = do
+  let Coin splitFee = independentSplitFee
+      per = (available - splitFee) `div` fromIntegral n
+      -- value conservation is exact: the first head absorbs the division rest
+      rest = (available - splitFee) - per * fromIntegral n
+      headValues = Coin (per + rest) : replicate (n - 1) (Coin per)
+  if per < 10000000
+    then Left "fund too small to fan out"
+    else do
+      body <-
+        first displayError $
+          createTransactionBody ShelleyBasedEraDijkstra $
+            defaultTxBodyContent ShelleyBasedEraDijkstra
+              & setTxIns [(spendTxIn, BuildTxWith (KeyWitness KeyWitnessForSpending))]
+              & setTxOuts (map (mkOutput localNodeNetworkId spendPaymentKey) headValues)
+              & setTxFee (TxFeeExplicit ShelleyBasedEraDijkstra independentSplitFee)
+              & setTxValidityLowerBound TxValidityNoLowerBound
+              & setTxValidityUpperBound (defaultTxValidityUpperBound ShelleyBasedEraDijkstra)
+              & setTxMetadata TxMetadataNone
+              & setTxInclusion (TxInclusion Urgent)
+      let splitTxId = getTxId body
+          tx = signShelleyTransaction ShelleyBasedEraDijkstra body [signingWitness spendWitness]
+          heads =
+            [ SpendableFund (TxIn splitTxId (TxIx (fromIntegral i))) v spendPaymentKey (SpendPayment spendPaymentKey)
+            | (i, v) <- zip [(0 :: Int) ..] headValues
+            ]
+      pure (tx, heads)
 
 -- | The actor population and demand spread, read live from a JSON file so it can
 -- be changed without restarting the feeder. Missing fields fall back to
@@ -449,6 +698,16 @@ data ActorConfig = ActorConfig
   , cfgOptimisticLatency :: !Double
   , cfgReservationMultiple :: !Double
   , cfgFeeBuffer :: !Double
+  , cfgDelayMs :: !(Maybe Int)
+    -- ^ Live override of the pause between demands — lets the dashboard pilot
+    -- the demand rate without restarting the feeder ('Nothing' = the CLI value).
+  , cfgLaneMix :: !(Maybe Double)
+    -- ^ Live override of the lane choice: the share of demands sent optimistic
+    -- (0 = all urgent, 1 = all optimistic). 'Nothing' = the actors decide
+    -- economically; set, the cockpit has the wheel and nobody walks away.
+  , cfgLabel :: !(Maybe String)
+    -- ^ Cockpit command label ("generation"). Stamped on every decision log
+    -- line so each tx can be tracked back to the command that caused it.
   }
 
 defaultActorConfig :: ActorConfig
@@ -465,6 +724,9 @@ defaultActorConfig =
     , cfgOptimisticLatency = 4
     , cfgReservationMultiple = 1
     , cfgFeeBuffer = 1.2
+    , cfgDelayMs = Nothing
+    , cfgLaneMix = Nothing
+    , cfgLabel = Nothing
     }
 
 instance Aeson.FromJSON ActorConfig where
@@ -482,6 +744,9 @@ instance Aeson.FromJSON ActorConfig where
         <*> o Aeson..:? "optimisticLatency" Aeson..!= cfgOptimisticLatency defaultActorConfig
         <*> o Aeson..:? "reservationMultiple" Aeson..!= cfgReservationMultiple defaultActorConfig
         <*> o Aeson..:? "feeBuffer" Aeson..!= cfgFeeBuffer defaultActorConfig
+        <*> o Aeson..:? "delayMs"
+        <*> o Aeson..:? "laneMix"
+        <*> o Aeson..:? "label"
 
 -- | Read the live actor config; fall back to the default when the file is missing
 -- or mid-write.
@@ -551,9 +816,15 @@ readPublishedQuotes path = do
 floorQuotes :: PublishedQuotes
 floorQuotes = PublishedQuotes{urgentQuote = 704, optimisticQuote = 44}
 
--- | One line per actor decision, parseable by the dashboard aggregator.
-logDecision :: Int -> ActorType -> LaneChoice -> Demand -> PublishedQuotes -> Integer -> IO ()
-logDecision counter actorType choice demand quotes bid =
+-- | One line per actor decision, parseable by the dashboard aggregator. The
+-- generation label ties the decision (and the accepted txid logged right after
+-- it, under the same n=) back to the cockpit command that was active when the
+-- tx was sent — that is what lets the dashboard track a command's lifecycle.
+logDecision :: Int -> ActorType -> LaneChoice -> Demand -> PublishedQuotes -> Integer -> Maybe String -> IO ()
+logDecision counter actorType choice demand quotes bid generation = do
+  -- Wall-clock stamp: the aggregator prefers it over its own clock so a log
+  -- replay (aggregator restart) reconstructs each generation's real time range.
+  now <- getPOSIXTime
   putStrLn $
     "actor decision: n="
       <> show counter
@@ -573,6 +844,13 @@ logDecision counter actorType choice demand quotes bid =
       <> show (optimisticQuote quotes)
       <> " bid="
       <> show bid
+      <> maybe "" ((" gen=" <>) . sanitizeLabel) generation
+      <> " t="
+      <> show (floor now :: Integer)
+
+-- | Keep the generation label single-token so the log line stays one-word-per-field.
+sanitizeLabel :: String -> String
+sanitizeLabel = map (\c -> if c == ' ' then '_' else c) . take 60
 
 renderType :: ActorType -> String
 renderType = \case
@@ -617,6 +895,8 @@ validateOptions LaneFeederOptions{..} = do
     die "--cycles must be positive"
   when (lfoOptimisticFirst == 0 && lfoUrgentAfter == 0) $
     die "At least one of --optimistic-first or --urgent-after must be positive"
+  when (lfoFanout < 1) $
+    die "--fanout must be at least 1"
 
 resolveSocket :: Maybe FilePath -> IO FilePath
 resolveSocket = \case
@@ -695,14 +975,30 @@ submitLaneTx
   -> SpendableFund
   -> (Int, Inclusion)
   -> IO SpendableFund
-submitLaneTx connectInfo fee metadata delayMs fund (index, inclusion) =
+submitLaneTx connectInfo fee metadata delayMs fund step =
+  submitLaneTxCatch connectInfo fee metadata delayMs fund step >>= either die pure
+
+-- | Like 'submitLaneTx', but reports failure instead of exiting — the actor
+-- mode drops the failed chain and keeps running on its other chains.
+submitLaneTxCatch
+  :: LocalNodeConnectInfo
+  -> Coin
+  -> TxMetadataInEra DijkstraEra
+  -> Int
+  -> SpendableFund
+  -> (Int, Inclusion)
+  -> IO (Either String SpendableFund)
+submitLaneTxCatch connectInfo fee metadata delayMs fund (index, inclusion) =
   case buildLaneTx connectInfo fee metadata fund inclusion of
     Left err ->
-      die $ "Failed to build tx " <> show index <> ": " <> err
+      pure $ Left $ "Failed to build tx " <> show index <> ": " <> err
     Right (tx, nextFund) -> do
-      submitWithBackpressure submitRetryBudget tx
-      pace delayMs
-      pure nextFund
+      outcome <- submitWithBackpressure submitRetryBudget tx
+      case outcome of
+        Left err -> pure (Left err)
+        Right () -> do
+          pace delayMs
+          pure (Right nextFund)
   where
     -- Under sustained load the mempool briefly fills, or the published quote
     -- momentarily overtakes the flat fee. Both clear once the next block forges,
@@ -711,27 +1007,36 @@ submitLaneTx connectInfo fee metadata delayMs fund (index, inclusion) =
     submitWithBackpressure attemptsLeft tx = do
       result <- submitTxToNodeLocal connectInfo (TxInMode ShelleyBasedEraDijkstra tx)
       case result of
-        TxSubmitSuccess ->
+        TxSubmitSuccess -> do
           putStrLn $
             show index
               <> ": accepted "
               <> renderInclusion inclusion
               <> " "
               <> show (getTxId (getTxBody tx))
+          pure (Right ())
         TxSubmitFail err
+          -- A spent input never comes back: the chain head lost a first-come
+          -- race or was consumed on-chain. Fail fast so the caller can drop
+          -- the chain instead of retrying for minutes.
+          | isPermanentRejection (show err) ->
+              pure $ Left $ show index <> ": rejected (permanent) " <> renderInclusion inclusion <> ": " <> show err
           | attemptsLeft > 0 -> retryAfterDrain attemptsLeft tx
           | otherwise ->
-              die $ show index <> ": rejected " <> renderInclusion inclusion <> ": " <> show err
+              pure $ Left $ show index <> ": rejected " <> renderInclusion inclusion <> ": " <> show err
         TxSubmitError err
           | attemptsLeft > 0 -> retryAfterDrain attemptsLeft tx
           | otherwise ->
-              die $ show index <> ": submit error " <> renderInclusion inclusion <> ": " <> show err
+              pure $ Left $ show index <> ": submit error " <> renderInclusion inclusion <> ": " <> show err
 
     retryAfterDrain attemptsLeft tx = do
       pace (max submitRetryDelayMs delayMs)
       submitWithBackpressure (attemptsLeft - 1) tx
 
     pace ms = when (ms > 0) (threadDelay (ms * 1000))
+
+    isPermanentRejection rendered =
+      any (`isInfixOf` rendered) ["AllInputsAreSpent", "BadInputsUTxO"]
 
 -- | How many times a single transaction is resubmitted while the mempool drains
 -- before the feeder gives up on it (at 'submitRetryDelayMs' apart).

@@ -147,3 +147,10 @@ optionsParser =
               <> help "Lovelace value of --initial-txin-2 (required together with it)."
           )
       )
+    <*> option auto
+      ( long "fanout"
+          <> metavar "N"
+          <> value 12
+          <> showDefault
+          <> help "Actor mode: parallel dependent chains per lane (a broken chain costs 1/N of the lane, not all of it)."
+      )
