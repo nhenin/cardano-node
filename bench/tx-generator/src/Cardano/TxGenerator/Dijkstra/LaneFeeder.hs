@@ -21,7 +21,23 @@ import Cardano.Benchmarking.GeneratorTx.SizedMetadata (mkMetadata)
 import Cardano.TxGenerator.Dijkstra.ActorPolicy
 
 import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (link, wait, withAsync)
+import Control.Concurrent.STM (
+  TBQueue,
+  TVar,
+  atomically,
+  isFullTBQueue,
+  newTBQueueIO,
+  newTVarIO,
+  readTVar,
+  retry,
+  tryReadTBQueue,
+  writeTBQueue,
+  writeTVar,
+ )
 import Control.Monad (foldM, when)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import Numeric.Natural (Natural)
 import qualified Data.Aeson as Aeson
 import Data.Bifunctor (first)
 import Data.Function ((&))
@@ -426,7 +442,42 @@ runActorLanes
         <> "+"
         <> show (length (laneFunds urgentChains))
         <> " chains"
-    let step optimisticLane urgentLane counter
+    -- The two lanes run as INDEPENDENT submitters. Before, one loop decided a
+    -- demand AND submitted it inline, so a lane whose pool was full — where
+    -- 'submitWithBackpressure' waits for the next block and resubmits — froze
+    -- the whole feeder: the other lane got no new traffic even with room to
+    -- spare (head-of-line blocking across lanes). Now a single decision loop
+    -- only decides (reading BOTH quotes, so the cross-lane substitution an
+    -- actor makes when one lane gets dear is preserved) and hands the work to
+    -- that lane's own bounded queue; one worker per lane drains its queue and
+    -- submits at its own pace. A full lane backs up ITS queue only — the other
+    -- lane keeps flowing.
+    urgentQueue <- newTBQueueIO laneQueueCapacity
+    optimisticQueue <- newTBQueueIO laneQueueCapacity
+    done <- newTVarIO False
+    -- Per-lane held-back latch: log only on a transition (flowing -> held and
+    -- back), never per demand — at delayMs=0 a full lane is offered thousands of
+    -- times a second, and logging each would flood the feeder log (which the
+    -- aggregator tails).
+    urgentHeld <- newIORef False
+    optimisticHeld <- newIORef False
+    let deliver queue heldRef laneName pace item = do
+          enqueued <- offerToLane queue item
+          wasHeld <- readIORef heldRef
+          if enqueued
+            then do
+              when wasHeld $ do
+                writeIORef heldRef False
+                putStrLn $ "lane flowing again: " <> laneName
+              pauseMs pace
+            else do
+              when (not wasHeld) $ do
+                writeIORef heldRef True
+                putStrLn $ "lane held-back: " <> laneName <> " (pool full, senders held back)"
+              -- Back off so a full lane doesn't spin the decision loop; the
+              -- other lane's queue is untouched, so it keeps flowing.
+              pauseMs (max heldBackBackoffMs pace)
+    let decisionLoop counter
           | counter > lfoCycles = pure ()
           | otherwise = do
               quotes <- readPublishedQuotes lfoQuotesFile
@@ -449,22 +500,85 @@ runActorLanes
                   -- the dashboard can re-pace the demand live via the config
                   pace = maybe lfoDelayMs id (cfgDelayMs config)
                   generation = cfgLabel config
-              (optimisticLane', urgentLane') <-
-                case choice of
-                  WalkAway -> do
-                    logDecision counter actorType WalkAway demand quotes 0 generation
-                    pauseMs (max actorWalkAwayPauseMs pace)
-                    pure (optimisticLane, urgentLane)
-                  BuyUrgent -> do
-                    logDecision counter actorType BuyUrgent demand quotes lfoFeeLovelace generation
-                    spent <- submitOnLane connectInfo bid liveMetadata pace urgentLane (counter, Urgent)
-                    pure (optimisticLane, spent)
-                  BuyOptimistic -> do
-                    logDecision counter actorType BuyOptimistic demand quotes lfoFeeLovelace generation
-                    spent <- submitOnLane connectInfo bid liveMetadata pace optimisticLane (counter, Optimistic)
-                    pure (spent, urgentLane)
-              step optimisticLane' urgentLane' (counter + 1)
-    step optimisticChains urgentChains 1
+              case choice of
+                WalkAway -> do
+                  logDecision counter actorType WalkAway demand quotes 0 generation
+                  pauseMs (max actorWalkAwayPauseMs pace)
+                BuyUrgent -> do
+                  logDecision counter actorType BuyUrgent demand quotes lfoFeeLovelace generation
+                  deliver urgentQueue urgentHeld "urgent" pace (counter, liveMetadata)
+                BuyOptimistic -> do
+                  logDecision counter actorType BuyOptimistic demand quotes lfoFeeLovelace generation
+                  deliver optimisticQueue optimisticHeld "optimistic" pace (counter, liveMetadata)
+              decisionLoop (counter + 1)
+    -- Run both lane workers alongside the decision loop; when it finishes,
+    -- signal 'done' so each worker drains its queue and exits.
+    withAsync (laneWorker connectInfo bid Urgent urgentQueue done urgentChains) $ \urgentW ->
+      withAsync (laneWorker connectInfo bid Optimistic optimisticQueue done optimisticChains) $ \optimisticW -> do
+        -- A worker that dies (its lane lost all chains -> 'die') must bring the
+        -- whole feeder down, so the demo supervisor sees it exit and
+        -- re-provisions both lanes. Without linking, the dead worker's exception
+        -- sits unobserved while the decision loop keeps enqueueing into a queue
+        -- nobody drains — the feeder looks alive but submits nothing.
+        link urgentW
+        link optimisticW
+        decisionLoop 1
+        atomically $ writeTVar done True
+        wait urgentW
+        wait optimisticW
+
+-- | One lane's outstanding submissions, bounded. When it is full the lane's
+-- pool cannot keep up (its worker is waiting out a full mempool), so the sender
+-- is held back — but ONLY on this lane; the other lane's queue is untouched.
+laneQueueCapacity :: Natural
+laneQueueCapacity = 256
+
+-- | How long the decision loop backs off after finding a lane's queue full, so
+-- a congested lane throttles instead of spinning (the other lane is untouched).
+heldBackBackoffMs :: Int
+heldBackBackoffMs = 40
+
+-- | Try to enqueue one demand for a lane without ever blocking; returns whether
+-- it was accepted. A full queue means the lane is congested (its pool is full
+-- and the worker is backpressured) — the caller holds the sender back on THIS
+-- lane only. The dashboard shows the lane as blocked from the pool's fullness.
+offerToLane :: TBQueue (Int, TxMetadataInEra DijkstraEra) -> (Int, TxMetadataInEra DijkstraEra) -> IO Bool
+offerToLane queue item =
+  atomically $ do
+    full <- isFullTBQueue queue
+    if full
+      then pure False
+      else writeTBQueue queue item >> pure True
+
+-- | Drain a lane's queue and submit each demand on the lane's own dependent
+-- chains, threading the chain state. Submission keeps its backpressure retry
+-- (a briefly-full pool clears on the next block), but a stall here now only
+-- backs up THIS lane. Exits once the decision loop is done and the queue is dry.
+laneWorker ::
+  LocalNodeConnectInfo ->
+  Coin ->
+  Inclusion ->
+  TBQueue (Int, TxMetadataInEra DijkstraEra) ->
+  TVar Bool ->
+  LaneChains ->
+  IO ()
+laneWorker connectInfo bid inclusion queue done = go
+ where
+  go chains = do
+    next <- atomically $ do
+      item <- tryReadTBQueue queue
+      case item of
+        Just x -> pure (Just x)
+        Nothing -> do
+          finished <- readTVar done
+          if finished then pure Nothing else retry
+    case next of
+      Nothing -> pure ()
+      Just (index, liveMetadata) -> do
+        -- pace 0: the decision loop already sets the demand tempo, so the
+        -- worker drains as fast as the pool accepts (retry waits still apply).
+        chains' <- submitOnLane connectInfo bid liveMetadata 0 chains (index, inclusion)
+        go chains'
 
 -- | A lane's working set: several parallel dependent chains, spent round-robin.
 -- One broken chain is dropped and costs 1/N of the throughput; the feeder only
