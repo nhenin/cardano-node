@@ -18,6 +18,7 @@ where
 
 import Cardano.Api
 import Cardano.Benchmarking.GeneratorTx.SizedMetadata (mkMetadata)
+import Cardano.Ledger.Address (AccountAddress (..), AccountId (..))
 import Cardano.TxGenerator.Dijkstra.ActorPolicy
 
 import Control.Concurrent (threadDelay)
@@ -102,6 +103,14 @@ data LaneFeederOptions = LaneFeederOptions
     -- ^ Actor mode: parallel dependent chains per lane. Each lane's fund is
     -- fanned out into this many chain heads, so one broken chain costs 1/N of
     -- the lane's throughput instead of all of it.
+  , lfoFeeRefundStakeKey :: !(Maybe FilePath)
+    -- ^ Staking verification key whose account collects every sender's fee
+    -- refund (the unused headroom between the bid and the charged quote).
+    -- Setting it makes the ledger's fee split real: base stays in the fee pot,
+    -- premium goes to the treasury, the refund flows back to this account.
+    -- Absent, the full bid stays in the fee pot. The account must be
+    -- REGISTERED (the devnet's genesis delegators are) — refunds owed to an
+    -- unregistered account stay pending forever.
   }
 
 data FundEntry = FundEntry
@@ -125,6 +134,9 @@ data SpendableFund = SpendableFund
   , spendValue :: !Coin
   , spendPaymentKey :: !(SigningKey PaymentKey)
   , spendWitness :: !SpendWitness
+  , spendFeeRefundAccount :: !(Maybe AccountAddress)
+    -- ^ Account collecting this sender's fee refunds (bid − quote). Successor
+    -- funds inherit it, so one flag at startup covers the whole chain.
   }
 
 -- | Submit the configured optimistic/urgent Dijkstra transaction chain.
@@ -155,18 +167,18 @@ runLaneFeeder options@LaneFeederOptions{..} = do
     then do
       initialFund <-
         overrideInitialFund options
-          =<< loadInitialFund networkId (takeDirectory fundsFile) selectedFundEntry
+          =<< loadInitialFund networkId lfoFeeRefundStakeKey (takeDirectory fundsFile) selectedFundEntry
       runConflictLanes options connectInfo fee metadata initialFund
     else if lfoIndependentFunding
     then do
       initialFund <-
         overrideInitialFund options
-          =<< loadInitialFund networkId (takeDirectory fundsFile) selectedFundEntry
+          =<< loadInitialFund networkId lfoFeeRefundStakeKey (takeDirectory fundsFile) selectedFundEntry
       runIndependentFunding options connectInfo fee metadata initialFund
     else if lfoIndependentLanes
     then runIndependentLanes options connectInfo fee metadata fundsFile fundEntries
     else do
-      initialFund <- loadInitialFund networkId (takeDirectory fundsFile) selectedFundEntry
+      initialFund <- loadInitialFund networkId lfoFeeRefundStakeKey (takeDirectory fundsFile) selectedFundEntry
       let lanePlan =
             concat $
               replicate lfoCycles $
@@ -189,7 +201,7 @@ runIndependentLanes ::
   [FundEntry] ->
   IO ()
 runIndependentLanes
-  LaneFeederOptions{lfoOptimisticFirst, lfoUrgentAfter, lfoCycles, lfoDelayMs}
+  LaneFeederOptions{lfoOptimisticFirst, lfoUrgentAfter, lfoCycles, lfoDelayMs, lfoFeeRefundStakeKey}
   connectInfo@LocalNodeConnectInfo{localNodeNetworkId}
   fee
   metadata
@@ -206,8 +218,8 @@ runIndependentLanes
       optimisticPlan = replicate (lfoCycles * lfoOptimisticFirst) Optimistic
       urgentPlan = replicate (lfoCycles * lfoUrgentAfter) Urgent
 
-  optimisticFund <- loadInitialFund localNodeNetworkId fundsDir optimisticEntry
-  urgentFund <- loadInitialFund localNodeNetworkId fundsDir urgentEntry
+  optimisticFund <- loadInitialFund localNodeNetworkId lfoFeeRefundStakeKey fundsDir optimisticEntry
+  urgentFund <- loadInitialFund localNodeNetworkId lfoFeeRefundStakeKey fundsDir urgentEntry
 
   putStrLn $
     "Submitting "
@@ -337,7 +349,7 @@ buildSplitTx ::
   Coin ->
   SpendableFund ->
   Either String (Tx DijkstraEra, [SpendableFund], SpendableFund)
-buildSplitTx LocalNodeConnectInfo{localNodeNetworkId} (Coin bidLovelace) SpendableFund{spendTxIn, spendValue = Coin available, spendPaymentKey, spendWitness} = do
+buildSplitTx LocalNodeConnectInfo{localNodeNetworkId} (Coin bidLovelace) SpendableFund{spendTxIn, spendValue = Coin available, spendPaymentKey, spendWitness, spendFeeRefundAccount} = do
   let perTx = bidLovelace + independentPoolHeadroom
       Coin splitFee = independentSplitFee
       change = available - perTx * fromIntegral independentPoolSize - splitFee
@@ -360,10 +372,11 @@ buildSplitTx LocalNodeConnectInfo{localNodeNetworkId} (Coin bidLovelace) Spendab
               -- spend them. The RB is applied before the EB, so an optimistic split
               -- would have its outputs created *after* the urgent demand is applied.
               & setTxInclusion (TxInclusion Urgent)
+              & setTxFeeRefundAccount (feeRefundAccountFor spendFeeRefundAccount)
       let splitTxId = getTxId body
           tx = signShelleyTransaction ShelleyBasedEraDijkstra body [signingWitness spendWitness]
           poolFunds =
-            [ SpendableFund (TxIn splitTxId (TxIx (fromIntegral i))) (Coin perTx) spendPaymentKey (SpendPayment spendPaymentKey)
+            [ SpendableFund (TxIn splitTxId (TxIx (fromIntegral i))) (Coin perTx) spendPaymentKey (SpendPayment spendPaymentKey) spendFeeRefundAccount
             | i <- [0 .. independentPoolSize - 1]
             ]
           nextChange =
@@ -372,6 +385,7 @@ buildSplitTx LocalNodeConnectInfo{localNodeNetworkId} (Coin bidLovelace) Spendab
               (Coin change)
               spendPaymentKey
               (SpendPayment spendPaymentKey)
+              spendFeeRefundAccount
       pure (tx, poolFunds, nextChange)
 
 -- | Pool entries created per split round. Bounded so the multi-output split tx
@@ -404,7 +418,7 @@ runActorLanes ::
   [FundEntry] ->
   IO ()
 runActorLanes
-  LaneFeederOptions{lfoMetadataBytes, lfoCycles, lfoDelayMs, lfoFeeLovelace, lfoQuotesFile, lfoActorConfig, lfoInitialTxIn, lfoInitialValue, lfoInitialTxIn2, lfoInitialValue2, lfoFanout}
+  LaneFeederOptions{lfoMetadataBytes, lfoCycles, lfoDelayMs, lfoFeeLovelace, lfoQuotesFile, lfoActorConfig, lfoInitialTxIn, lfoInitialValue, lfoInitialTxIn2, lfoInitialValue2, lfoFanout, lfoFeeRefundStakeKey}
   connectInfo@LocalNodeConnectInfo{localNodeNetworkId}
   metadata
   fundsFile
@@ -422,10 +436,10 @@ runActorLanes
         bid = Coin lfoFeeLovelace
     optimisticAnchor <-
       overrideFund lfoInitialTxIn lfoInitialValue
-        =<< loadInitialFund localNodeNetworkId fundsDir optimisticEntry
+        =<< loadInitialFund localNodeNetworkId lfoFeeRefundStakeKey fundsDir optimisticEntry
     urgentAnchor <-
       overrideFund lfoInitialTxIn2 lfoInitialValue2
-        =<< loadInitialFund localNodeNetworkId fundsDir urgentEntry
+        =<< loadInitialFund localNodeNetworkId lfoFeeRefundStakeKey fundsDir urgentEntry
     optimisticChains <-
       provisionLane connectInfo lfoFanout lfoFeeLovelace "optimistic" optimisticAnchor
     urgentChains <-
@@ -763,6 +777,7 @@ discoverFunds connectInfo@LocalNodeConnectInfo{localNodeNetworkId} anchor = do
                 if txIn == spendTxIn anchor
                   then spendWitness anchor
                   else SpendPayment (spendPaymentKey anchor)
+            , spendFeeRefundAccount = spendFeeRefundAccount anchor
             }
         | (txIn, TxOut _ value _ _) <- Map.toList (unUTxO utxo)
         ]
@@ -774,7 +789,7 @@ buildFanoutTx
   -> Int
   -> SpendableFund
   -> Either String (Tx DijkstraEra, [SpendableFund])
-buildFanoutTx LocalNodeConnectInfo{localNodeNetworkId} n SpendableFund{spendTxIn, spendValue = Coin available, spendPaymentKey, spendWitness} = do
+buildFanoutTx LocalNodeConnectInfo{localNodeNetworkId} n SpendableFund{spendTxIn, spendValue = Coin available, spendPaymentKey, spendWitness, spendFeeRefundAccount} = do
   let Coin splitFee = independentSplitFee
       per = (available - splitFee) `div` fromIntegral n
       -- value conservation is exact: the first head absorbs the division rest
@@ -794,10 +809,11 @@ buildFanoutTx LocalNodeConnectInfo{localNodeNetworkId} n SpendableFund{spendTxIn
               & setTxValidityUpperBound (defaultTxValidityUpperBound ShelleyBasedEraDijkstra)
               & setTxMetadata TxMetadataNone
               & setTxInclusion (TxInclusion Urgent)
+              & setTxFeeRefundAccount (feeRefundAccountFor spendFeeRefundAccount)
       let splitTxId = getTxId body
           tx = signShelleyTransaction ShelleyBasedEraDijkstra body [signingWitness spendWitness]
           heads =
-            [ SpendableFund (TxIn splitTxId (TxIx (fromIntegral i))) v spendPaymentKey (SpendPayment spendPaymentKey)
+            [ SpendableFund (TxIn splitTxId (TxIx (fromIntegral i))) v spendPaymentKey (SpendPayment spendPaymentKey) spendFeeRefundAccount
             | (i, v) <- zip [(0 :: Int) ..] headValues
             ]
       pure (tx, heads)
@@ -1031,8 +1047,10 @@ resolveSocket = \case
       Just path -> pure path
       Nothing -> die "Missing --socket and CARDANO_NODE_SOCKET_PATH is not set"
 
-loadInitialFund :: NetworkId -> FilePath -> FundEntry -> IO SpendableFund
-loadInitialFund networkId fundsDir FundEntry{entrySigningKey, entryValue} = do
+loadInitialFund ::
+  NetworkId -> Maybe FilePath -> FilePath -> FundEntry -> IO SpendableFund
+loadInitialFund networkId feeRefundStakeKey fundsDir FundEntry{entrySigningKey, entryValue} = do
+  feeRefundAccount <- traverse (readFeeRefundAccount networkId) feeRefundStakeKey
   let keyPath =
         if isRelative entrySigningKey
           then fundsDir </> entrySigningKey
@@ -1048,6 +1066,7 @@ loadInitialFund networkId fundsDir FundEntry{entrySigningKey, entryValue} = do
       , spendValue = entryValue
       , spendPaymentKey = paymentKey
       , spendWitness = SpendGenesis genesisKey
+      , spendFeeRefundAccount = feeRefundAccount
       }
 
 -- | Restart support: replace the fund's genesis pseudo-input with an explicit
@@ -1073,6 +1092,25 @@ overrideFund initialTxIn initialValue fund =
           , spendWitness = SpendPayment (spendPaymentKey fund)
           }
     _ -> die "--initial-txin and --initial-value must be given together"
+
+-- | The sender's refund account, as the tx-body field (absent = the ledger
+-- keeps the full bid in the fee pot).
+feeRefundAccountFor :: Maybe AccountAddress -> TxFeeRefundAccount DijkstraEra
+feeRefundAccountFor = maybe TxFeeRefundAccountNone TxFeeRefundAccount
+
+-- | Read the staking verification key whose account collects the fee refunds.
+-- The devnet's genesis delegators are registered, so their refunds actually
+-- flush; an unregistered account would leave them pending forever.
+readFeeRefundAccount :: NetworkId -> FilePath -> IO AccountAddress
+readFeeRefundAccount networkId path = do
+  vkey <- either (die . show) pure =<< readStakeVKey
+  pure $
+    AccountAddress
+      (toShelleyNetwork networkId)
+      (AccountId (toShelleyStakeCredential (StakeCredentialByKey (verificationKeyHash vkey))))
+ where
+  readStakeVKey :: IO (Either (FileError TextEnvelopeError) (VerificationKey StakeKey))
+  readStakeVKey = readFileTextEnvelope (File path)
 
 readLaneSigningKey :: FilePath -> IO (SigningKey PaymentKey, SigningKey GenesisUTxOKey)
 readLaneSigningKey keyPath = do
@@ -1192,6 +1230,7 @@ buildLaneTx LocalNodeConnectInfo{localNodeNetworkId} fee metadata SpendableFund{
           & setTxValidityUpperBound (defaultTxValidityUpperBound ShelleyBasedEraDijkstra)
           & setTxMetadata metadata
           & setTxInclusion (TxInclusion inclusion)
+          & setTxFeeRefundAccount (feeRefundAccountFor spendFeeRefundAccount)
 
   let tx = signShelleyTransaction ShelleyBasedEraDijkstra body [signingWitness spendWitness]
       nextFund =
@@ -1200,6 +1239,7 @@ buildLaneTx LocalNodeConnectInfo{localNodeNetworkId} fee metadata SpendableFund{
           , spendValue = outputValue
           , spendPaymentKey = spendPaymentKey
           , spendWitness = SpendPayment spendPaymentKey
+          , spendFeeRefundAccount = spendFeeRefundAccount
           }
   pure (tx, nextFund)
 

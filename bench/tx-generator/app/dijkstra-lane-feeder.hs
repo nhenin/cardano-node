@@ -154,3 +154,10 @@ optionsParser =
           <> showDefault
           <> help "Actor mode: parallel dependent chains per lane (a broken chain costs 1/N of the lane, not all of it)."
       )
+    <*> optional
+      ( strOption
+          ( long "fee-refund-stake-vkey"
+              <> metavar "FILE"
+              <> help "Staking verification key whose account collects each sender's fee refund (bid - quote). Makes the ledger's fee split real: base to the fee pot, premium to the treasury, refund back to this account. Must be a REGISTERED account (the devnet's genesis delegators are); without this flag the full bid stays in the fee pot."
+          )
+      )
