@@ -19,6 +19,8 @@ where
 import Cardano.Api
 import Cardano.Benchmarking.GeneratorTx.SizedMetadata (mkMetadata)
 import Cardano.Ledger.Address (AccountAddress (..), AccountId (..))
+import Cardano.Ledger.Core (ppTxFeeFixedL)
+import Lens.Micro ((^.))
 import Cardano.TxGenerator.Dijkstra.ActorPolicy
 
 import Control.Concurrent (threadDelay)
@@ -433,7 +435,6 @@ runActorLanes
         -- quote overtaking a per-tx bid) would break the whole chain downstream.
         -- The elasticity in the demo comes from the actor walking away, not from
         -- mempool eviction.
-        bid = Coin lfoFeeLovelace
     optimisticAnchor <-
       overrideFund lfoInitialTxIn lfoInitialValue
         =<< loadInitialFund localNodeNetworkId lfoFeeRefundStakeKey fundsDir optimisticEntry
@@ -466,6 +467,11 @@ runActorLanes
     -- that lane's own bounded queue; one worker per lane drains its queue and
     -- submits at its own pace. A full lane backs up ITS queue only — the other
     -- lane keeps flowing.
+    minFeeB <- queryMinFeeB connectInfo
+    putStrLn $
+      "realistic bids: quote x live fee buffer, capped at "
+        <> show lfoFeeLovelace
+        <> " lovelace (minFeeB=" <> show minFeeB <> ")"
     urgentQueue <- newTBQueueIO laneQueueCapacity
     optimisticQueue <- newTBQueueIO laneQueueCapacity
     done <- newTVarIO False
@@ -514,21 +520,35 @@ runActorLanes
                   -- the dashboard can re-pace the demand live via the config
                   pace = maybe lfoDelayMs id (cfgDelayMs config)
                   generation = cfgLabel config
+                  -- Realistic bid: the chosen lane's live quote x the cockpit's
+                  -- fee buffer, capped by the FEE ceiling. The estimate is the
+                  -- ledger's own arithmetic — quote = minFeeB + rate x size,
+                  -- exact because the published rate never sits below the
+                  -- floor and the floor here IS minFeeA. Buffer <= 0 is the
+                  -- cockpit's escape hatch back to flat-ceiling bids.
+                  laneBid rate =
+                    let quoteEstimate = minFeeB + rate * fromIntegral (demandSize demand)
+                        buffered = ceiling (cfgFeeBuffer config * fromIntegral quoteEstimate :: Double)
+                     in if cfgFeeBuffer config <= 0
+                          then lfoFeeLovelace
+                          else max quoteEstimate (min lfoFeeLovelace buffered)
+                  urgentBid = laneBid (urgentQuote quotes)
+                  optimisticBid = laneBid (optimisticQuote quotes)
               case choice of
                 WalkAway -> do
                   logDecision counter actorType WalkAway demand quotes 0 generation
                   pauseMs (max actorWalkAwayPauseMs pace)
                 BuyUrgent -> do
-                  logDecision counter actorType BuyUrgent demand quotes lfoFeeLovelace generation
-                  deliver urgentQueue urgentHeld "urgent" pace (counter, liveMetadata)
+                  logDecision counter actorType BuyUrgent demand quotes urgentBid generation
+                  deliver urgentQueue urgentHeld "urgent" pace (counter, liveMetadata, Coin urgentBid)
                 BuyOptimistic -> do
-                  logDecision counter actorType BuyOptimistic demand quotes lfoFeeLovelace generation
-                  deliver optimisticQueue optimisticHeld "optimistic" pace (counter, liveMetadata)
+                  logDecision counter actorType BuyOptimistic demand quotes optimisticBid generation
+                  deliver optimisticQueue optimisticHeld "optimistic" pace (counter, liveMetadata, Coin optimisticBid)
               decisionLoop (counter + 1)
     -- Run both lane workers alongside the decision loop; when it finishes,
     -- signal 'done' so each worker drains its queue and exits.
-    withAsync (laneWorker connectInfo bid Urgent urgentQueue done urgentChains) $ \urgentW ->
-      withAsync (laneWorker connectInfo bid Optimistic optimisticQueue done optimisticChains) $ \optimisticW -> do
+    withAsync (laneWorker connectInfo Urgent urgentQueue done urgentChains) $ \urgentW ->
+      withAsync (laneWorker connectInfo Optimistic optimisticQueue done optimisticChains) $ \optimisticW -> do
         -- A worker that dies (its lane lost all chains -> 'die') must bring the
         -- whole feeder down, so the demo supervisor sees it exit and
         -- re-provisions both lanes. Without linking, the dead worker's exception
@@ -556,7 +576,7 @@ heldBackBackoffMs = 40
 -- it was accepted. A full queue means the lane is congested (its pool is full
 -- and the worker is backpressured) — the caller holds the sender back on THIS
 -- lane only. The dashboard shows the lane as blocked from the pool's fullness.
-offerToLane :: TBQueue (Int, TxMetadataInEra DijkstraEra) -> (Int, TxMetadataInEra DijkstraEra) -> IO Bool
+offerToLane :: TBQueue (Int, TxMetadataInEra DijkstraEra, Coin) -> (Int, TxMetadataInEra DijkstraEra, Coin) -> IO Bool
 offerToLane queue item =
   atomically $ do
     full <- isFullTBQueue queue
@@ -570,13 +590,12 @@ offerToLane queue item =
 -- backs up THIS lane. Exits once the decision loop is done and the queue is dry.
 laneWorker ::
   LocalNodeConnectInfo ->
-  Coin ->
   Inclusion ->
-  TBQueue (Int, TxMetadataInEra DijkstraEra) ->
+  TBQueue (Int, TxMetadataInEra DijkstraEra, Coin) ->
   TVar Bool ->
   LaneChains ->
   IO ()
-laneWorker connectInfo bid inclusion queue done = go
+laneWorker connectInfo inclusion queue done = go
  where
   go chains = do
     next <- atomically $ do
@@ -588,7 +607,7 @@ laneWorker connectInfo bid inclusion queue done = go
           if finished then pure Nothing else retry
     case next of
       Nothing -> pure ()
-      Just (index, liveMetadata) -> do
+      Just (index, liveMetadata, bid) -> do
         -- pace 0: the decision loop already sets the demand tempo, so the
         -- worker drains as fast as the pool accepts (retry waits still apply).
         chains' <- submitOnLane connectInfo bid liveMetadata 0 chains (index, inclusion)
@@ -1092,6 +1111,23 @@ overrideFund initialTxIn initialValue fund =
           , spendWitness = SpendPayment (spendPaymentKey fund)
           }
     _ -> die "--initial-txin and --initial-value must be given together"
+
+-- | The protocol's fixed fee term, queried from the node once at startup.
+-- Realistic bids price a transaction exactly as the ledger will:
+-- quote = minFeeB + rate x size (the published rate never sits below the
+-- floor, and the floor is minFeeA on this devnet).
+queryMinFeeB :: LocalNodeConnectInfo -> IO Integer
+queryMinFeeB connectInfo = do
+  result <-
+    runExceptT $
+      queryNodeLocalState connectInfo VolatileTip $
+        QueryInEra (QueryInShelleyBasedEra ShelleyBasedEraDijkstra QueryProtocolParameters)
+  case result of
+    Left failure -> die ("protocol-params query failed (acquire): " <> show failure)
+    Right (Left mismatch) -> die ("protocol-params query failed (era): " <> show mismatch)
+    Right (Right pp) ->
+      let Coin fixedFee = pp ^. ppTxFeeFixedL
+       in pure fixedFee
 
 -- | The sender's refund account, as the tx-body field (absent = the ledger
 -- keeps the full bid in the fee pot).
