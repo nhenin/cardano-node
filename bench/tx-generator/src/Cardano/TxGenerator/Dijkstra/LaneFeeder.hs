@@ -532,7 +532,10 @@ runActorLanes
                      in if cfgFeeBuffer config <= 0
                           then lfoFeeLovelace
                           else max quoteEstimate (min lfoFeeLovelace buffered)
-                  urgentBid = laneBid (urgentQuote quotes)
+                  -- The CIP's fee-cap basis: an urgent transaction may settle
+                  -- through either path, so its bid covers the LARGER of the
+                  -- two quotes even while the lanes cross.
+                  urgentBid = laneBid (max (urgentQuote quotes) (optimisticQuote quotes))
                   optimisticBid = laneBid (optimisticQuote quotes)
               case choice of
                 WalkAway -> do
