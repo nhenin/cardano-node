@@ -6,6 +6,11 @@ on:
 
 jobs:
   build:
+    # The dynamic-pricing prototype branch builds against sibling checkouts
+    # (cabal.project points at ../cardano-ledger etc.), which no CI runner
+    # has - evaluating the flake there can only fail. Keep this check where
+    # it means something: the upstream repository.
+    if: github.repository == 'IntersectMBO/cardano-node'
     runs-on: ubuntu-latest
 
     defaults:
