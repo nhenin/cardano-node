@@ -1195,7 +1195,7 @@ submitLaneTxCatch connectInfo fee metadata delayMs fund (index, inclusion) =
     Left err ->
       pure $ Left $ "Failed to build tx " <> show index <> ": " <> err
     Right (tx, nextFund) -> do
-      outcome <- submitWithBackpressure submitRetryBudget tx
+      outcome <- submitWithBackpressure pendingParentBudget submitRetryBudget tx
       case outcome of
         Left err -> pure (Left err)
         Right () -> do
@@ -1206,7 +1206,7 @@ submitLaneTxCatch connectInfo fee metadata delayMs fund (index, inclusion) =
     -- momentarily overtakes the flat fee. Both clear once the next block forges,
     -- so we wait and resubmit the very same transaction (the chain is fixed)
     -- rather than giving up. A finite budget still backstops a stuck chain.
-    submitWithBackpressure attemptsLeft tx = do
+    submitWithBackpressure pendingLeft attemptsLeft tx = do
       result <- submitTxToNodeLocal connectInfo (TxInMode ShelleyBasedEraDijkstra tx)
       case result of
         TxSubmitSuccess -> do
@@ -1218,22 +1218,27 @@ submitLaneTxCatch connectInfo fee metadata delayMs fund (index, inclusion) =
               <> show (getTxId (getTxBody tx))
           pure (Right ())
         TxSubmitFail err
-          -- A spent input never comes back: the chain head lost a first-come
-          -- race or was consumed on-chain. Fail fast so the caller can drop
-          -- the chain instead of retrying for minutes.
+          -- Since the announced-EB mempool strip, a chain parent riding an
+          -- endorser block leaves the mempool before its outputs exist on
+          -- chain: the child's inputs LOOK spent until the certificate
+          -- applies. Give the certificate its window before declaring the
+          -- chain dead — a genuine first-come loss stays dead after it.
+          | isPermanentRejection (show err), pendingLeft > 0 -> do
+              pace pendingParentDelayMs
+              submitWithBackpressure (pendingLeft - 1) attemptsLeft tx
           | isPermanentRejection (show err) ->
               pure $ Left $ show index <> ": rejected (permanent) " <> renderInclusion inclusion <> ": " <> show err
-          | attemptsLeft > 0 -> retryAfterDrain attemptsLeft tx
+          | attemptsLeft > 0 -> retryAfterDrain pendingLeft attemptsLeft tx
           | otherwise ->
               pure $ Left $ show index <> ": rejected " <> renderInclusion inclusion <> ": " <> show err
         TxSubmitError err
-          | attemptsLeft > 0 -> retryAfterDrain attemptsLeft tx
+          | attemptsLeft > 0 -> retryAfterDrain pendingLeft attemptsLeft tx
           | otherwise ->
               pure $ Left $ show index <> ": submit error " <> renderInclusion inclusion <> ": " <> show err
 
-    retryAfterDrain attemptsLeft tx = do
+    retryAfterDrain pendingLeft attemptsLeft tx = do
       pace (max submitRetryDelayMs delayMs)
-      submitWithBackpressure (attemptsLeft - 1) tx
+      submitWithBackpressure pendingLeft (attemptsLeft - 1) tx
 
     pace ms = when (ms > 0) (threadDelay (ms * 1000))
 
@@ -1248,6 +1253,16 @@ submitRetryBudget = 1200
 -- | Minimum pause between resubmissions, in milliseconds.
 submitRetryDelayMs :: Int
 submitRetryDelayMs = 250
+
+-- | How many times an apparently-spent input is retried before the chain is
+-- declared dead, at 'pendingParentDelayMs' apart — together they span the
+-- certification window of an endorser block the chain's parent may be riding.
+pendingParentBudget :: Int
+pendingParentBudget = 12
+
+-- | Pause between apparently-spent-input retries, in milliseconds.
+pendingParentDelayMs :: Int
+pendingParentDelayMs = 5000
 
 buildLaneTx
   :: LocalNodeConnectInfo
