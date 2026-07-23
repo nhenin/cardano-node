@@ -685,7 +685,7 @@ submitOnLane connectInfo fee metadata delayMs = go
             | otherwise -> do
                 let parked =
                       chain
-                        { chainParkedUntilNs = now + msToNs pendingParentDelayMs
+                        { chainParkedUntilNs = now + msToNs (pendingParentDelayMs + slot * chainStaggerMs)
                         , chainParkCount = chainParkCount chain + 1
                         }
                 go
@@ -731,7 +731,7 @@ submitOnLane connectInfo fee metadata delayMs = go
             <> renderInclusion inclusion
             <> ") on "
             <> show (spendTxIn fresh)
-        let parked = (freshChain fresh){chainParkedUntilNs = now + msToNs pendingParentDelayMs}
+        let parked = (freshChain fresh){chainParkedUntilNs = now + msToNs (pendingParentDelayMs + slot * chainStaggerMs)}
         go
           chains{laneChains = replaceAt slot parked (laneChains chains), laneCursor = slot + 1}
           (index, inclusion)
@@ -1385,6 +1385,14 @@ pendingParentBudget = 36
 -- certified resumes within the same round instead of skipping one.
 pendingParentDelayMs :: Int
 pendingParentDelayMs = 2000
+
+-- | Per-chain stagger added to every park. Without it the lane's chains
+-- all ride the same endorser block, wait out the same certificate and
+-- resume as ONE HERD: the ranking block's fullness square-waves and the
+-- urgent quote sawtooths with it. Spread across the fan-out this turns
+-- the herd back into a crowd.
+chainStaggerMs :: Int
+chainStaggerMs = 150
 
 buildLaneTx
   :: LocalNodeConnectInfo
