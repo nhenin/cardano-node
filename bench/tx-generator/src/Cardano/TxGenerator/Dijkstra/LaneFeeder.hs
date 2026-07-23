@@ -49,7 +49,8 @@ import qualified Data.Map.Strict as Map
 import Data.Ord (Down (..))
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import qualified Data.Set as Set
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
+import GHC.Clock (getMonotonicTimeNSec)
 import System.Directory (doesFileExist, makeAbsolute)
 import System.Environment (lookupEnv)
 import System.Exit (die)
@@ -453,9 +454,9 @@ runActorLanes
         <> ", policy from "
         <> lfoActorConfig
         <> ", "
-        <> show (length (laneFunds optimisticChains))
+        <> show (length (laneChains optimisticChains))
         <> "+"
-        <> show (length (laneFunds urgentChains))
+        <> show (length (laneChains urgentChains))
         <> " chains"
     -- The two lanes run as INDEPENDENT submitters. Before, one loop decided a
     -- demand AND submitted it inline, so a lane whose pool was full — where
@@ -567,8 +568,10 @@ runActorLanes
 -- | One lane's outstanding submissions, bounded. When it is full the lane's
 -- pool cannot keep up (its worker is waiting out a full mempool), so the sender
 -- is held back — but ONLY on this lane; the other lane's queue is untouched.
+-- Deep enough that a certificate window (every chain briefly parked) does not
+-- read as held-back at storm rates.
 laneQueueCapacity :: Natural
-laneQueueCapacity = 256
+laneQueueCapacity = 1024
 
 -- | How long the decision loop backs off after finding a lane's queue full, so
 -- a congested lane throttles instead of spinning (the other lane is untouched).
@@ -617,16 +620,36 @@ laneWorker connectInfo inclusion queue done = go
         go chains'
 
 -- | A lane's working set: several parallel dependent chains, spent round-robin.
--- One broken chain is dropped and costs 1/N of the throughput; the feeder only
--- dies (for the demo runner to re-provision) when a lane has no chain left.
+-- A chain whose head looks spent is PARKED — its parent is riding an announced
+-- endorser block, and the outputs only exist once the certificate applies —
+-- and the demand moves on to the next chain, so the worker never sleeps on one
+-- chain while others are ready. A chain still pending after the full window is
+-- broken (its parent was evicted by a price rise, or lost a first-come race)
+-- and RE-ANCHORS: its last landed head still sits unspent at the fund address,
+-- so a fresh discovery picks it back up. The feeder only dies (for the demo
+-- runner to re-provision) when a lane has no chain left and the address offers
+-- nothing spendable.
 data LaneChains = LaneChains
-  { laneFunds :: ![SpendableFund]
+  { laneChains :: ![Chain]
   , laneCursor :: !Int
+  , laneAnchor :: !SpendableFund
+  , laneChainFloor :: !Coin
   }
 
--- | Submit one tx on the lane's next chain. A permanent rejection (the chain
--- head lost a first-come race, e.g. against a crashed feeder's in-flight txs)
--- drops that chain and the lane keeps going on the others.
+-- | One dependent chain: its spendable head and its parking state.
+data Chain = Chain
+  { chainFund :: !SpendableFund
+  , chainParkedUntilNs :: !Word64
+  , chainParkCount :: !Int
+  }
+
+freshChain :: SpendableFund -> Chain
+freshChain fund = Chain{chainFund = fund, chainParkedUntilNs = 0, chainParkCount = 0}
+
+-- | Submit one tx on the lane's next AVAILABLE chain — parked chains are
+-- skipped until their certificate window opens again. Only when EVERY chain
+-- is parked does the lane wait; that wait replaces the old in-place sleep
+-- that stalled the whole worker behind a single pending parent.
 submitOnLane
   :: LocalNodeConnectInfo
   -> Coin
@@ -635,29 +658,101 @@ submitOnLane
   -> LaneChains
   -> (Int, Inclusion)
   -> IO LaneChains
-submitOnLane connectInfo fee metadata delayMs LaneChains{laneFunds, laneCursor} (index, inclusion) = do
-  let count = length laneFunds
-      slot = laneCursor `mod` max 1 count
-      fund = laneFunds !! slot
-  outcome <- submitLaneTxCatch connectInfo fee metadata delayMs fund (index, inclusion)
-  case outcome of
-    Right next ->
-      pure LaneChains{laneFunds = replaceAt slot next laneFunds, laneCursor = slot + 1}
-    Left err -> do
-      putStrLn $
-        show index
-          <> ": chain "
-          <> show (slot + 1)
-          <> "/"
-          <> show count
-          <> " dropped ("
-          <> renderInclusion inclusion
-          <> "): "
-          <> err
-      let rest = deleteAt slot laneFunds
-      when (null rest) $
-        die $ renderInclusion inclusion <> " lane lost all its chains — restart to re-provision"
-      pure LaneChains{laneFunds = rest, laneCursor = slot}
+submitOnLane connectInfo fee metadata delayMs = go
+ where
+  go chains (index, inclusion) = do
+    when (null (laneChains chains)) $
+      die $ renderInclusion inclusion <> " lane lost all its chains — restart to re-provision"
+    now <- getMonotonicTimeNSec
+    case availableSlot now chains of
+      Nothing -> do
+        let soonest = minimum (map chainParkedUntilNs (laneChains chains))
+        pauseMs (nsToMsCeiling (soonest - now))
+        go chains (index, inclusion)
+      Just slot -> do
+        let chain = laneChains chains !! slot
+        outcome <- submitLaneTxCatch connectInfo fee metadata delayMs (chainFund chain) (index, inclusion)
+        case outcome of
+          SubmitAccepted next ->
+            pure
+              chains
+                { laneChains = replaceAt slot (freshChain next) (laneChains chains)
+                , laneCursor = slot + 1
+                }
+          SubmitParentPending
+            | chainParkCount chain >= pendingParentBudget ->
+                dropChain slot chains (index, inclusion) "input still spent after the certificate window (first-come loss)"
+            | otherwise -> do
+                let parked =
+                      chain
+                        { chainParkedUntilNs = now + msToNs pendingParentDelayMs
+                        , chainParkCount = chainParkCount chain + 1
+                        }
+                go
+                  chains
+                    { laneChains = replaceAt slot parked (laneChains chains)
+                    , laneCursor = slot + 1
+                    }
+                  (index, inclusion)
+          SubmitChainDead err -> dropChain slot chains (index, inclusion) err
+
+  -- A broken chain re-anchors on the spot: discovery returns the fund
+  -- address's unspent outputs, and the chain adopts the biggest one no
+  -- other chain is holding — its own last landed head, typically. The
+  -- fresh chain starts parked one beat so a contested head cannot spin
+  -- the worker; the SAME demand tries the next chain meanwhile. Only when
+  -- the address offers nothing is the chain dropped.
+  dropChain slot chains (index, inclusion) err = do
+    putStrLn $
+      show index
+        <> ": chain "
+        <> show (slot + 1)
+        <> "/"
+        <> show (length (laneChains chains))
+        <> " broken ("
+        <> renderInclusion inclusion
+        <> "): "
+        <> err
+    let inUse = Set.fromList (map (spendTxIn . chainFund) (laneChains chains))
+    discovered <- discoverFunds connectInfo (laneAnchor chains)
+    let usable =
+          sortOn (Down . spendValue) $
+            filter
+              (\f -> spendValue f >= laneChainFloor chains && not (spendTxIn f `Set.member` inUse))
+              discovered
+    case usable of
+      fresh : _ -> do
+        now <- getMonotonicTimeNSec
+        putStrLn $
+          show index
+            <> ": chain "
+            <> show (slot + 1)
+            <> " re-anchored ("
+            <> renderInclusion inclusion
+            <> ") on "
+            <> show (spendTxIn fresh)
+        let parked = (freshChain fresh){chainParkedUntilNs = now + msToNs pendingParentDelayMs}
+        go
+          chains{laneChains = replaceAt slot parked (laneChains chains), laneCursor = slot + 1}
+          (index, inclusion)
+      [] ->
+        go
+          chains{laneChains = deleteAt slot (laneChains chains), laneCursor = slot}
+          (index, inclusion)
+
+  -- The first chain at or after the cursor whose parking window has passed.
+  availableSlot now chains =
+    let count = length (laneChains chains)
+        candidates = [(laneCursor chains + offset) `mod` count | offset <- [0 .. count - 1]]
+     in case filter (\slot -> chainParkedUntilNs (laneChains chains !! slot) <= now) candidates of
+          slot : _ -> Just slot
+          [] -> Nothing
+
+msToNs :: Int -> Word64
+msToNs ms = fromIntegral ms * 1000000
+
+nsToMsCeiling :: Word64 -> Int
+nsToMsCeiling ns = fromIntegral ((ns + 999999) `div` 1000000)
 
 replaceAt :: Int -> a -> [a] -> [a]
 replaceAt i x xs = case splitAt i xs of
@@ -703,7 +798,14 @@ provisionLane connectInfo fanout feeLovelace laneName anchor = attempt provision
             <> " UTxO(s) already at the fund address"
         pure usable
     let missing = fanout - length base
-        settled = pure LaneChains{laneFunds = base, laneCursor = 0}
+        settled =
+          pure
+            LaneChains
+              { laneChains = map freshChain base
+              , laneCursor = 0
+              , laneAnchor = anchor
+              , laneChainFloor = minChain
+              }
     if missing <= 0
       then settled
       else case sortOn (Down . spendValue) base of
@@ -725,7 +827,13 @@ provisionLane connectInfo fanout feeLovelace laneName anchor = attempt provision
                       <> " chains ("
                       <> show (getTxId (getTxBody splitTx))
                       <> ")"
-                  pure LaneChains{laneFunds = pieces <> rest, laneCursor = 0}
+                  pure
+                    LaneChains
+                      { laneChains = map freshChain (pieces <> rest)
+                      , laneCursor = 0
+                      , laneAnchor = anchor
+                      , laneChainFloor = minChain
+                      }
                 failure
                   | attemptsLeft > 1 -> do
                       putStrLn $
@@ -1169,6 +1277,18 @@ castToGenesisUTxOKey :: SigningKey PaymentKey -> SigningKey GenesisUTxOKey
 castToGenesisUTxOKey (PaymentSigningKey skey) =
   GenesisUTxOSigningKey skey
 
+-- | The three ways a submission can leave a chain.
+data SubmitOutcome
+  = -- | Accepted: the chain advances to its next head.
+    SubmitAccepted !SpendableFund
+  | -- | The head's inputs LOOK spent: since the announced-EB mempool strip, a
+    -- chain parent riding an endorser block leaves the mempool before its
+    -- outputs exist on chain. The chain must be parked for the certificate's
+    -- window, not buried.
+    SubmitParentPending
+  | -- | This chain is finished (build failure or retry exhaustion): drop it.
+    SubmitChainDead !String
+
 submitLaneTx
   :: LocalNodeConnectInfo
   -> Coin
@@ -1177,11 +1297,23 @@ submitLaneTx
   -> SpendableFund
   -> (Int, Inclusion)
   -> IO SpendableFund
-submitLaneTx connectInfo fee metadata delayMs fund step =
-  submitLaneTxCatch connectInfo fee metadata delayMs fund step >>= either die pure
+submitLaneTx connectInfo fee metadata delayMs fund step = attempt pendingParentBudget
+ where
+  -- The sequential modes have no other chain to switch to, so a pending
+  -- parent is waited out in place.
+  attempt budget = do
+    outcome <- submitLaneTxCatch connectInfo fee metadata delayMs fund step
+    case outcome of
+      SubmitAccepted next -> pure next
+      SubmitChainDead err -> die err
+      SubmitParentPending
+        | budget > 0 -> do
+            threadDelay (pendingParentDelayMs * 1000)
+            attempt (budget - 1)
+        | otherwise -> die "input still spent after the certificate window"
 
--- | Like 'submitLaneTx', but reports failure instead of exiting — the actor
--- mode drops the failed chain and keeps running on its other chains.
+-- | Build and submit one tx on a chain, reporting the outcome — the actor
+-- mode parks or drops the chain instead of exiting.
 submitLaneTxCatch
   :: LocalNodeConnectInfo
   -> Coin
@@ -1189,24 +1321,18 @@ submitLaneTxCatch
   -> Int
   -> SpendableFund
   -> (Int, Inclusion)
-  -> IO (Either String SpendableFund)
+  -> IO SubmitOutcome
 submitLaneTxCatch connectInfo fee metadata delayMs fund (index, inclusion) =
   case buildLaneTx connectInfo fee metadata fund inclusion of
     Left err ->
-      pure $ Left $ "Failed to build tx " <> show index <> ": " <> err
-    Right (tx, nextFund) -> do
-      outcome <- submitWithBackpressure pendingParentBudget submitRetryBudget tx
-      case outcome of
-        Left err -> pure (Left err)
-        Right () -> do
-          pace delayMs
-          pure (Right nextFund)
+      pure $ SubmitChainDead $ "Failed to build tx " <> show index <> ": " <> err
+    Right (tx, nextFund) -> submitWithBackpressure submitRetryBudget tx nextFund
   where
     -- Under sustained load the mempool briefly fills, or the published quote
     -- momentarily overtakes the flat fee. Both clear once the next block forges,
     -- so we wait and resubmit the very same transaction (the chain is fixed)
     -- rather than giving up. A finite budget still backstops a stuck chain.
-    submitWithBackpressure pendingLeft attemptsLeft tx = do
+    submitWithBackpressure attemptsLeft tx nextFund = do
       result <- submitTxToNodeLocal connectInfo (TxInMode ShelleyBasedEraDijkstra tx)
       case result of
         TxSubmitSuccess -> do
@@ -1216,29 +1342,21 @@ submitLaneTxCatch connectInfo fee metadata delayMs fund (index, inclusion) =
               <> renderInclusion inclusion
               <> " "
               <> show (getTxId (getTxBody tx))
-          pure (Right ())
+          pace delayMs
+          pure (SubmitAccepted nextFund)
         TxSubmitFail err
-          -- Since the announced-EB mempool strip, a chain parent riding an
-          -- endorser block leaves the mempool before its outputs exist on
-          -- chain: the child's inputs LOOK spent until the certificate
-          -- applies. Give the certificate its window before declaring the
-          -- chain dead — a genuine first-come loss stays dead after it.
-          | isPermanentRejection (show err), pendingLeft > 0 -> do
-              pace pendingParentDelayMs
-              submitWithBackpressure (pendingLeft - 1) attemptsLeft tx
-          | isPermanentRejection (show err) ->
-              pure $ Left $ show index <> ": rejected (permanent) " <> renderInclusion inclusion <> ": " <> show err
-          | attemptsLeft > 0 -> retryAfterDrain pendingLeft attemptsLeft tx
+          | isPermanentRejection (show err) -> pure SubmitParentPending
+          | attemptsLeft > 0 -> retryAfterDrain attemptsLeft tx nextFund
           | otherwise ->
-              pure $ Left $ show index <> ": rejected " <> renderInclusion inclusion <> ": " <> show err
+              pure $ SubmitChainDead $ show index <> ": rejected " <> renderInclusion inclusion <> ": " <> show err
         TxSubmitError err
-          | attemptsLeft > 0 -> retryAfterDrain pendingLeft attemptsLeft tx
+          | attemptsLeft > 0 -> retryAfterDrain attemptsLeft tx nextFund
           | otherwise ->
-              pure $ Left $ show index <> ": submit error " <> renderInclusion inclusion <> ": " <> show err
+              pure $ SubmitChainDead $ show index <> ": submit error " <> renderInclusion inclusion <> ": " <> show err
 
-    retryAfterDrain pendingLeft attemptsLeft tx = do
+    retryAfterDrain attemptsLeft tx nextFund = do
       pace (max submitRetryDelayMs delayMs)
-      submitWithBackpressure pendingLeft (attemptsLeft - 1) tx
+      submitWithBackpressure (attemptsLeft - 1) tx nextFund
 
     pace ms = when (ms > 0) (threadDelay (ms * 1000))
 
@@ -1254,15 +1372,19 @@ submitRetryBudget = 1200
 submitRetryDelayMs :: Int
 submitRetryDelayMs = 250
 
--- | How many times an apparently-spent input is retried before the chain is
--- declared dead, at 'pendingParentDelayMs' apart — together they span the
--- certification window of an endorser block the chain's parent may be riding.
+-- | How many times in a row a chain may be parked on an apparently-spent
+-- input before it is declared dead — with 'pendingParentDelayMs' between
+-- parks this spans several certification windows, because the leadership
+-- lottery routinely leaves 40-60 s gaps between blocks and a certificate
+-- can only land in a block.
 pendingParentBudget :: Int
-pendingParentBudget = 12
+pendingParentBudget = 36
 
--- | Pause between apparently-spent-input retries, in milliseconds.
+-- | How long a parked chain sits out before its next attempt, in
+-- milliseconds — under one block interval, so a chain whose parent just
+-- certified resumes within the same round instead of skipping one.
 pendingParentDelayMs :: Int
-pendingParentDelayMs = 5000
+pendingParentDelayMs = 2000
 
 buildLaneTx
   :: LocalNodeConnectInfo
