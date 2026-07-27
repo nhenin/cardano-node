@@ -298,28 +298,61 @@ runIndependentFunding ::
   TxMetadataInEra DijkstraEra ->
   SpendableFund ->
   IO ()
-runIndependentFunding LaneFeederOptions{lfoCycles, lfoDelayMs} connectInfo bid metadata initialFund = do
+runIndependentFunding
+  LaneFeederOptions{lfoCycles, lfoDelayMs, lfoOptimisticFirst, lfoUrgentAfter}
+  connectInfo
+  bid
+  metadata
+  initialFund = do
   putStrLn $
     "Independent funding: "
       <> show lfoCycles
-      <> " rounds of "
-      <> show independentPoolSize
-      <> " independent urgent txs, each from its own UTxO (bid "
+      <> " bursts of "
+      <> show independentBurstSize
+      <> " independent "
+      <> renderInclusion demandInclusion
+      <> " txs, each from its own UTxO (bid "
       <> show bid
       <> ")."
-  _ <- foldM runRound initialFund [(1 :: Int) .. lfoCycles]
+  _ <- foldM runBurst initialFund [(1 :: Int) .. lfoCycles]
   pure ()
   where
-    runRound changeFund roundIx =
+    demandInclusion
+      | lfoOptimisticFirst > 0 && lfoUrgentAfter <= 0 = Optimistic
+      | otherwise = Urgent
+
+    runBurst changeFund burstIx = do
+      (nextChange, poolFunds) <-
+        foldM
+          (preparePool burstIx)
+          (changeFund, [])
+          [(1 :: Int) .. independentBurstPoolCount]
+      putStrLn $
+        "burst "
+          <> show burstIx
+          <> ": "
+          <> show (length poolFunds)
+          <> " confirmed UTxOs ready; submitting demand"
+      mapM_ submitDemand (zip [(1 :: Int) ..] poolFunds)
+      pure nextChange
+
+    preparePool burstIx (changeFund, accumulated) poolIx =
       case buildSplitTx connectInfo bid changeFund of
-        Left err -> die $ "round " <> show roundIx <> " split failed: " <> err
+        Left err -> die $ "burst " <> show burstIx <> " split " <> show poolIx <> " failed: " <> err
         Right (splitTx, poolFunds, nextChange) -> do
           putStrLn $
-            "round " <> show roundIx <> ": split into " <> show (length poolFunds) <> " UTxOs, waiting for it to settle"
+            "burst "
+              <> show burstIx
+              <> ": split "
+              <> show poolIx
+              <> "/"
+              <> show independentBurstPoolCount
+              <> " into "
+              <> show (length poolFunds)
+              <> " UTxOs; waiting for ledger confirmation"
           submitSplit splitTx
-          threadDelay (independentSplitSettleMs * 1000)
-          mapM_ submitDemand (zip [(1 :: Int) ..] poolFunds)
-          pure nextChange
+          waitForPoolConfirmation nextChange poolFunds independentSplitConfirmAttempts
+          pure (nextChange, accumulated <> poolFunds)
 
     submitSplit tx = do
       result <- submitTxToNodeLocal connectInfo (TxInMode ShelleyBasedEraDijkstra tx)
@@ -331,13 +364,32 @@ runIndependentFunding LaneFeederOptions{lfoCycles, lfoDelayMs} connectInfo bid m
     -- One independent urgent tx per pool UTxO, submitted once (no retry): it is
     -- meant to sit in the mempool and be evicted if the quote climbs past its bid.
     submitDemand (index, fund) =
-      case buildLaneTx connectInfo bid metadata fund Urgent of
+      case buildLaneTx connectInfo bid metadata fund demandInclusion of
         Left err -> putStrLn $ show index <> ": build failed: " <> err
         Right (tx, _) -> do
           result <- submitTxToNodeLocal connectInfo (TxInMode ShelleyBasedEraDijkstra tx)
           putStrLn $
-            show index <> ": urgent " <> show (getTxId (getTxBody tx)) <> " -> " <> renderSubmit result
+            show index
+              <> ": "
+              <> renderInclusion demandInclusion
+              <> " "
+              <> show (getTxId (getTxBody tx))
+              <> " -> "
+              <> renderSubmit result
           pauseMs lfoDelayMs
+
+    waitForPoolConfirmation anchor expected attemptsLeft = do
+      discovered <- discoverFunds connectInfo anchor
+      let confirmed = Set.fromList (map spendTxIn discovered)
+          expectedInputs = Set.fromList (map spendTxIn expected)
+      if expectedInputs `Set.isSubsetOf` confirmed
+        then putStrLn $ "split confirmed: " <> show (Set.size expectedInputs) <> " pool UTxOs are on ledger"
+        else
+          if attemptsLeft <= 0
+            then die "split confirmation timed out"
+            else do
+              pauseMs independentSplitConfirmPollMs
+              waitForPoolConfirmation anchor expected (attemptsLeft - 1)
 
     renderSubmit = \case
       TxSubmitSuccess -> "accepted (evicted if the quote climbs past the bid)"
@@ -396,6 +448,15 @@ buildSplitTx LocalNodeConnectInfo{localNodeNetworkId} (Coin bidLovelace) Spendab
 independentPoolSize :: Int
 independentPoolSize = 220
 
+-- | One EB can absorb a single 220-tx split before the quote moves. Two pools
+-- leave a genuine backlog after the EB merge, so the controller can overtake
+-- the burst bid and exercise revalidation rather than only door rejection.
+independentBurstPoolCount :: Int
+independentBurstPoolCount = 2
+
+independentBurstSize :: Int
+independentBurstSize = independentPoolSize * independentBurstPoolCount
+
 -- | Lovelace each pool UTxO carries above the bid, so its change output stays above
 -- the minimum UTxO value after the bid is paid.
 independentPoolHeadroom :: Integer
@@ -405,9 +466,14 @@ independentPoolHeadroom = 2000000
 independentSplitFee :: Coin
 independentSplitFee = Coin 20000000
 
--- | How long to let a split settle on-chain before spending its pool outputs.
-independentSplitSettleMs :: Int
-independentSplitSettleMs = 45000
+-- | Observe confirmation instead of sleeping a fixed 45 seconds. Blocks are
+-- irregular, so a fixed wait was both slow in the common case and racy after a
+-- long leadership gap.
+independentSplitConfirmPollMs :: Int
+independentSplitConfirmPollMs = 500
+
+independentSplitConfirmAttempts :: Int
+independentSplitConfirmAttempts = 240
 
 -- | Drive submissions with the actor decision policy. Each step samples a demand,
 -- reads the live published quotes, and lets the actor buy the urgent or optimistic
@@ -475,6 +541,7 @@ runActorLanes
         <> " lovelace (minFeeB=" <> show minFeeB <> ")"
     urgentQueue <- newTBQueueIO laneQueueCapacity
     optimisticQueue <- newTBQueueIO laneQueueCapacity
+    currentGeneration <- newTVarIO Nothing
     done <- newTVarIO False
     -- Per-lane held-back latch: log only on a transition (flowing -> held and
     -- back), never per demand — at delayMs=0 a full lane is offered thousands of
@@ -494,7 +561,7 @@ runActorLanes
             else do
               when (not wasHeld) $ do
                 writeIORef heldRef True
-                putStrLn $ "lane held-back: " <> laneName <> " (pool full, senders held back)"
+                putStrLn $ "lane held-back: " <> laneName <> " (feeder backpressured, senders held back)"
               -- Back off so a full lane doesn't spin the decision loop; the
               -- other lane's queue is untouched, so it keeps flowing.
               pauseMs (max heldBackBackoffMs pace)
@@ -538,21 +605,22 @@ runActorLanes
                   -- two quotes even while the lanes cross.
                   urgentBid = laneBid (max (urgentQuote quotes) (optimisticQuote quotes))
                   optimisticBid = laneBid (optimisticQuote quotes)
+              atomically $ writeTVar currentGeneration generation
               case choice of
                 WalkAway -> do
                   logDecision counter actorType WalkAway demand quotes 0 generation
                   pauseMs (max actorWalkAwayPauseMs pace)
                 BuyUrgent -> do
                   logDecision counter actorType BuyUrgent demand quotes urgentBid generation
-                  deliver urgentQueue urgentHeld "urgent" pace (counter, liveMetadata, Coin urgentBid)
+                  deliver urgentQueue urgentHeld "urgent" pace (counter, liveMetadata, Coin urgentBid, generation)
                 BuyOptimistic -> do
                   logDecision counter actorType BuyOptimistic demand quotes optimisticBid generation
-                  deliver optimisticQueue optimisticHeld "optimistic" pace (counter, liveMetadata, Coin optimisticBid)
+                  deliver optimisticQueue optimisticHeld "optimistic" pace (counter, liveMetadata, Coin optimisticBid, generation)
               decisionLoop (counter + 1)
     -- Run both lane workers alongside the decision loop; when it finishes,
     -- signal 'done' so each worker drains its queue and exits.
-    withAsync (laneWorker connectInfo Urgent urgentQueue done urgentChains) $ \urgentW ->
-      withAsync (laneWorker connectInfo Optimistic optimisticQueue done optimisticChains) $ \optimisticW -> do
+    withAsync (laneWorker connectInfo Urgent urgentQueue currentGeneration done urgentChains) $ \urgentW ->
+      withAsync (laneWorker connectInfo Optimistic optimisticQueue currentGeneration done optimisticChains) $ \optimisticW -> do
         -- A worker that dies (its lane lost all chains -> 'die') must bring the
         -- whole feeder down, so the demo supervisor sees it exit and
         -- re-provisions both lanes. Without linking, the dead worker's exception
@@ -582,7 +650,9 @@ heldBackBackoffMs = 40
 -- it was accepted. A full queue means the lane is congested (its pool is full
 -- and the worker is backpressured) — the caller holds the sender back on THIS
 -- lane only. The dashboard shows the lane as blocked from the pool's fullness.
-offerToLane :: TBQueue (Int, TxMetadataInEra DijkstraEra, Coin) -> (Int, TxMetadataInEra DijkstraEra, Coin) -> IO Bool
+type DemandItem = (Int, TxMetadataInEra DijkstraEra, Coin, Maybe String)
+
+offerToLane :: TBQueue DemandItem -> DemandItem -> IO Bool
 offerToLane queue item =
   atomically $ do
     full <- isFullTBQueue queue
@@ -597,38 +667,40 @@ offerToLane queue item =
 laneWorker ::
   LocalNodeConnectInfo ->
   Inclusion ->
-  TBQueue (Int, TxMetadataInEra DijkstraEra, Coin) ->
+  TBQueue DemandItem ->
+  TVar (Maybe String) ->
   TVar Bool ->
   LaneChains ->
   IO ()
-laneWorker connectInfo inclusion queue done = go
+laneWorker connectInfo inclusion queue currentGeneration done = go
  where
   go chains = do
     next <- atomically $ do
       item <- tryReadTBQueue queue
       case item of
-        Just x -> pure (Just x)
+        Just x -> do
+          generation <- readTVar currentGeneration
+          pure (Just (x, generation))
         Nothing -> do
           finished <- readTVar done
           if finished then pure Nothing else retry
     case next of
       Nothing -> pure ()
-      Just (index, liveMetadata, bid) -> do
+      Just ((_, _, _, generation), activeGeneration)
+        | generation /= activeGeneration ->
+            go chains
+      Just ((index, liveMetadata, bid, generation), _) -> do
         -- pace 0: the decision loop already sets the demand tempo, so the
         -- worker drains as fast as the pool accepts (retry waits still apply).
-        chains' <- submitOnLane connectInfo bid liveMetadata 0 chains (index, inclusion)
+        let stillCurrent = atomically $ (== generation) <$> readTVar currentGeneration
+        chains' <- submitOnLane connectInfo bid liveMetadata 0 stillCurrent chains (index, inclusion)
         go chains'
 
 -- | A lane's working set: several parallel dependent chains, spent round-robin.
--- A chain whose head looks spent is PARKED — its parent is riding an announced
--- endorser block, and the outputs only exist once the certificate applies —
--- and the demand moves on to the next chain, so the worker never sleeps on one
--- chain while others are ready. A chain still pending after the full window is
--- broken (its parent was evicted by a price rise, or lost a first-come race)
--- and RE-ANCHORS: its last landed head still sits unspent at the fund address,
--- so a fresh discovery picks it back up. The feeder only dies (for the demo
--- runner to re-provision) when a lane has no chain left and the address offers
--- nothing spendable.
+-- A chain whose head looks spent is PARKED: its parent may be riding an
+-- announced endorser block, so its output only exists once the certificate
+-- applies. A chain still pending after the full window is broken and re-anchors
+-- on a confirmed UTxO not held by another chain.
 data LaneChains = LaneChains
   { laneChains :: ![Chain]
   , laneCursor :: !Int
@@ -655,53 +727,64 @@ submitOnLane
   -> Coin
   -> TxMetadataInEra DijkstraEra
   -> Int
+  -> IO Bool
   -> LaneChains
   -> (Int, Inclusion)
   -> IO LaneChains
-submitOnLane connectInfo fee metadata delayMs = go
+submitOnLane connectInfo fee metadata delayMs stillCurrent = go
  where
   go chains (index, inclusion) = do
-    when (null (laneChains chains)) $
-      die $ renderInclusion inclusion <> " lane lost all its chains — restart to re-provision"
-    now <- getMonotonicTimeNSec
-    case availableSlot now chains of
-      Nothing -> do
-        let soonest = minimum (map chainParkedUntilNs (laneChains chains))
-        pauseMs (nsToMsCeiling (soonest - now))
-        go chains (index, inclusion)
-      Just slot -> do
-        let chain = laneChains chains !! slot
-        outcome <- submitLaneTxCatch connectInfo fee metadata delayMs (chainFund chain) (index, inclusion)
-        case outcome of
-          SubmitAccepted next ->
-            pure
-              chains
-                { laneChains = replaceAt slot (freshChain next) (laneChains chains)
-                , laneCursor = slot + 1
-                }
-          SubmitParentPending
-            | chainParkCount chain >= pendingParentBudget ->
-                dropChain slot chains (index, inclusion) "input still spent after the certificate window (first-come loss)"
-            | otherwise -> do
-                let parked =
-                      chain
-                        { chainParkedUntilNs = now + msToNs (pendingParentDelayMs + slot * chainStaggerMs)
-                        , chainParkCount = chainParkCount chain + 1
-                        }
-                go
+    active <- stillCurrent
+    if not active
+      then pure chains
+      else do
+        when (null (laneChains chains)) $
+          die $ renderInclusion inclusion <> " lane lost all its chains - restart to re-provision"
+        now <- getMonotonicTimeNSec
+        case availableSlot now chains of
+          Nothing -> do
+            let soonest = minimum (map chainParkedUntilNs (laneChains chains))
+                waitMs = min laneRefreshPollMs (nsToMsCeiling (soonest - now))
+            pauseMs waitMs
+            go chains (index, inclusion)
+          Just slot -> do
+            let chain = laneChains chains !! slot
+            outcome <-
+              submitLaneTxCatchWhile
+                stillCurrent
+                connectInfo
+                fee
+                metadata
+                delayMs
+                (chainFund chain)
+                (index, inclusion)
+            case outcome of
+              SubmitCancelled -> pure chains
+              SubmitAccepted next ->
+                pure
                   chains
-                    { laneChains = replaceAt slot parked (laneChains chains)
+                    { laneChains = replaceAt slot (freshChain next) (laneChains chains)
                     , laneCursor = slot + 1
                     }
-                  (index, inclusion)
-          SubmitChainDead err -> dropChain slot chains (index, inclusion) err
+              SubmitParentPending
+                | chainParkCount chain >= pendingParentBudget ->
+                    dropChain slot chains (index, inclusion) "input still spent after the certificate window (first-come loss)"
+                | otherwise -> do
+                    let parked =
+                          chain
+                            { chainParkedUntilNs = now + msToNs (pendingParentDelayMs + slot * chainStaggerMs)
+                            , chainParkCount = chainParkCount chain + 1
+                            }
+                    go
+                      chains
+                        { laneChains = replaceAt slot parked (laneChains chains)
+                        , laneCursor = slot + 1
+                        }
+                      (index, inclusion)
+              SubmitChainDead err -> dropChain slot chains (index, inclusion) err
 
-  -- A broken chain re-anchors on the spot: discovery returns the fund
-  -- address's unspent outputs, and the chain adopts the biggest one no
-  -- other chain is holding — its own last landed head, typically. The
-  -- fresh chain starts parked one beat so a contested head cannot spin
-  -- the worker; the SAME demand tries the next chain meanwhile. Only when
-  -- the address offers nothing is the chain dropped.
+  -- Re-anchor only the broken chain. A lane-wide confirmed-snapshot reset also
+  -- rewinds healthy chains whose descendants are still valid in the mempool.
   dropChain slot chains (index, inclusion) err = do
     putStrLn $
       show index
@@ -731,9 +814,15 @@ submitOnLane connectInfo fee metadata delayMs = go
             <> renderInclusion inclusion
             <> ") on "
             <> show (spendTxIn fresh)
-        let parked = (freshChain fresh){chainParkedUntilNs = now + msToNs (pendingParentDelayMs + slot * chainStaggerMs)}
+        let parked =
+              (freshChain fresh)
+                { chainParkedUntilNs = now + msToNs (pendingParentDelayMs + slot * chainStaggerMs)
+                }
         go
-          chains{laneChains = replaceAt slot parked (laneChains chains), laneCursor = slot + 1}
+          chains
+            { laneChains = replaceAt slot parked (laneChains chains)
+            , laneCursor = slot + 1
+            }
           (index, inclusion)
       [] ->
         go
@@ -741,18 +830,25 @@ submitOnLane connectInfo fee metadata delayMs = go
           (index, inclusion)
 
   -- The first chain at or after the cursor whose parking window has passed.
-  availableSlot now chains =
-    let count = length (laneChains chains)
-        candidates = [(laneCursor chains + offset) `mod` count | offset <- [0 .. count - 1]]
-     in case filter (\slot -> chainParkedUntilNs (laneChains chains !! slot) <= now) candidates of
-          slot : _ -> Just slot
-          [] -> Nothing
+  availableSlot now chains
+    | null (laneChains chains) = Nothing
+    | otherwise =
+        let count = length (laneChains chains)
+            candidates = [(laneCursor chains + offset) `mod` count | offset <- [0 .. count - 1]]
+         in case filter (\slot -> chainParkedUntilNs (laneChains chains !! slot) <= now) candidates of
+              slot : _ -> Just slot
+              [] -> Nothing
 
 msToNs :: Int -> Word64
 msToNs ms = fromIntegral ms * 1000000
 
 nsToMsCeiling :: Word64 -> Int
 nsToMsCeiling ns = fromIntegral ((ns + 999999) `div` 1000000)
+
+-- | Maximum sleep while all chains are parked, so a scenario change still
+-- cancels the active demand promptly.
+laneRefreshPollMs :: Int
+laneRefreshPollMs = 500
 
 replaceAt :: Int -> a -> [a] -> [a]
 replaceAt i x xs = case splitAt i xs of
@@ -786,6 +882,13 @@ provisionLane connectInfo fanout feeLovelace laneName anchor = attempt provision
     discovered <- discoverFunds connectInfo anchor
     let minChain = Coin (chainFloorFeeMultiple * feeLovelace)
         usable = take fanout (sortOn (Down . spendValue) (filter ((>= minChain) . spendValue) discovered))
+        mkLaneChains funds =
+          LaneChains
+            { laneChains = map freshChain funds
+            , laneCursor = 0
+            , laneAnchor = anchor
+            , laneChainFloor = minChain
+            }
     base <- case usable of
       [] -> do
         putStrLn $ laneName <> " lane: no spendable UTxO discovered, using the configured anchor"
@@ -799,48 +902,36 @@ provisionLane connectInfo fanout feeLovelace laneName anchor = attempt provision
         pure usable
     let missing = fanout - length base
         settled =
-          pure
-            LaneChains
-              { laneChains = map freshChain base
-              , laneCursor = 0
-              , laneAnchor = anchor
-              , laneChainFloor = minChain
-              }
+          pure (mkLaneChains base)
     if missing <= 0
       then settled
       else case sortOn (Down . spendValue) base of
         [] -> settled
-        biggest : rest ->
-          case buildFanoutTx connectInfo (missing + 1) biggest of
-            Left err -> do
+        biggest : _ -> do
+          fanoutResult <- submitFanoutTree connectInfo (missing + 1) biggest
+          case fanoutResult of
+            Right pieces -> do
               putStrLn $
-                laneName <> " lane: fan-out skipped (" <> err <> "); running on " <> show (length base) <> " chain(s)"
-              settled
-            Right (splitTx, pieces) -> do
-              result <- submitTxToNodeLocal connectInfo (TxInMode ShelleyBasedEraDijkstra splitTx)
-              case result of
-                TxSubmitSuccess -> do
+                laneName
+                  <> " lane: provisioned "
+                  <> show (length pieces)
+                  <> " fan-out heads; waiting for "
+                  <> show fanout
+                  <> " confirmed chains"
+              confirmed <- awaitConfirmedFanout connectInfo minChain fanout anchor
+              case confirmed of
+                Just funds -> do
                   putStrLn $
                     laneName
-                      <> " lane: fanned the largest UTxO out into "
-                      <> show (length pieces)
-                      <> " chains ("
-                      <> show (getTxId (getTxBody splitTx))
-                      <> ")"
-                  pure
-                    LaneChains
-                      { laneChains = map freshChain (pieces <> rest)
-                      , laneCursor = 0
-                      , laneAnchor = anchor
-                      , laneChainFloor = minChain
-                      }
-                failure
+                      <> " lane: "
+                      <> show (length funds)
+                      <> " confirmed chains ready"
+                  pure (mkLaneChains funds)
+                Nothing
                   | attemptsLeft > 1 -> do
                       putStrLn $
                         laneName
-                          <> " lane: fan-out attempt failed ("
-                          <> renderSubmitFailure failure
-                          <> "), re-discovering in "
+                          <> " lane: fan-out confirmation was not stable; re-discovering in "
                           <> show (provisionRetryDelayMs `div` 1000)
                           <> "s"
                       pauseMs provisionRetryDelayMs
@@ -848,12 +939,151 @@ provisionLane connectInfo fanout feeLovelace laneName anchor = attempt provision
                   | otherwise -> do
                       putStrLn $
                         laneName
-                          <> " lane: fan-out gave up ("
-                          <> renderSubmitFailure failure
-                          <> "); running on "
+                          <> " lane: fan-out confirmation gave up; running on "
                           <> show (length base)
-                          <> " chain(s)"
-                      settled
+                          <> " confirmed chain(s)"
+                      pure (mkLaneChains base)
+            Left err
+              | attemptsLeft > 1 -> do
+                  putStrLn $
+                    laneName
+                      <> " lane: fan-out attempt failed ("
+                      <> err
+                      <> "), re-discovering in "
+                      <> show (provisionRetryDelayMs `div` 1000)
+                      <> "s"
+                  pauseMs provisionRetryDelayMs
+                  attempt (attemptsLeft - 1)
+              | otherwise -> do
+                  putStrLn $
+                    laneName
+                      <> " lane: fan-out gave up ("
+                      <> err
+                      <> "); running on "
+                      <> show (length base)
+                      <> " chain(s)"
+                  settled
+
+-- | Provision more heads than fit in one transaction without exceeding the
+-- maximum transaction size: split the root into a few seeds, then split each
+-- seed into at most 320 final heads.
+submitFanoutTree
+  :: LocalNodeConnectInfo
+  -> Int
+  -> SpendableFund
+  -> IO (Either String [SpendableFund])
+submitFanoutTree connectInfo total fund
+  | total <= fanoutBatchSize = submitSplit total fund
+  | otherwise = do
+      let seedCount = (total + fanoutBatchSize - 1) `div` fanoutBatchSize
+          (whole, extra) = total `divMod` seedCount
+          chunkSizes = replicate extra (whole + 1) <> replicate (seedCount - extra) whole
+      seedsResult <- submitSplit seedCount fund
+      case seedsResult of
+        Left err -> pure (Left err)
+        Right seeds -> do
+          seedsReady <- awaitSpecificFunds seeds
+          if seedsReady
+            then splitSeedBatches chunkSizes seeds []
+            else pure (Left "seed fan-out did not confirm")
+ where
+  submitSplit count source =
+    case buildFanoutTx connectInfo count source of
+      Left err -> pure (Left err)
+      Right (splitTx, pieces) -> do
+        result <- submitTxToNodeLocal connectInfo (TxInMode ShelleyBasedEraDijkstra splitTx)
+        pure $ case result of
+          TxSubmitSuccess -> Right pieces
+          failure -> Left (renderSubmitFailure failure)
+
+  splitSeedBatches [] [] pieces = pure (Right pieces)
+  splitSeedBatches counts seeds pieces = do
+    let (batchCounts, remainingCounts) = splitAt fanoutSplitsPerBlock counts
+        (batchSeeds, remainingSeeds) = splitAt fanoutSplitsPerBlock seeds
+    result <- submitSeedBatch batchCounts batchSeeds []
+    case result of
+      Left err -> pure (Left err)
+      Right batch -> do
+        batchReady <- awaitSpecificFunds batch
+        if batchReady
+          then splitSeedBatches remainingCounts remainingSeeds (pieces <> batch)
+          else pure (Left "fan-out batch did not confirm")
+
+  submitSeedBatch [] [] pieces = pure (Right pieces)
+  submitSeedBatch (count : counts) (seed : seeds) pieces = do
+    result <- submitSplit count seed
+    case result of
+      Left err -> pure (Left err)
+      Right batch -> submitSeedBatch counts seeds (pieces <> batch)
+  submitSeedBatch _ _ _ = pure (Left "internal fan-out seed mismatch")
+
+  awaitSpecificFunds expected = go fanoutConfirmationPolls
+   where
+    expectedInputs = Set.fromList (map spendTxIn expected)
+    go pollsLeft = do
+      discovered <- discoverFunds connectInfo fund
+      let confirmedInputs = Set.fromList (map spendTxIn discovered)
+      if expectedInputs `Set.isSubsetOf` confirmedInputs
+        then do
+          pauseMs fanoutSettlementDelayMs
+          settled <- discoverFunds connectInfo fund
+          let settledInputs = Set.fromList (map spendTxIn settled)
+          pure (expectedInputs `Set.isSubsetOf` settledInputs)
+        else
+          if pollsLeft <= 1
+            then pure False
+            else pauseMs fanoutConfirmationPollMs >> go (pollsLeft - 1)
+
+fanoutBatchSize :: Int
+fanoutBatchSize = 320
+
+-- Five ~14 KB split transactions stay below one 90 KB ranking block, so none
+-- of the provisioning tree needs to ride an endorser block.
+fanoutSplitsPerBlock :: Int
+fanoutSplitsPerBlock = 5
+
+-- | Do not start the crowd on mempool-only split outputs. Waiting until all
+-- heads are in ledger state prevents the first workload EB from invalidating
+-- an entire tree of dependent transactions.
+awaitConfirmedFanout
+  :: LocalNodeConnectInfo
+  -> Coin
+  -> Int
+  -> SpendableFund
+  -> IO (Maybe [SpendableFund])
+awaitConfirmedFanout connectInfo minChain target anchor = go fanoutConfirmationPolls
+ where
+  go pollsLeft = do
+    discovered <- discoverFunds connectInfo anchor
+    let usable =
+          take target $
+            sortOn (Down . spendValue) $
+              filter ((>= minChain) . spendValue) discovered
+    if length usable >= target
+      then do
+        pauseMs fanoutSettlementDelayMs
+        settled <- discoverFunds connectInfo anchor
+        let stable =
+              take target $
+                sortOn (Down . spendValue) $
+                  filter ((>= minChain) . spendValue) settled
+        pure $ if length stable >= target then Just stable else Nothing
+      else
+        if pollsLeft <= 1
+          then pure Nothing
+          else pauseMs fanoutConfirmationPollMs >> go (pollsLeft - 1)
+
+fanoutConfirmationPolls :: Int
+fanoutConfirmationPolls = 240
+
+fanoutConfirmationPollMs :: Int
+fanoutConfirmationPollMs = 500
+
+-- A volatile-tip query can expose outputs that disappear on the next rollback.
+-- Recheck them after at least one expected devnet block interval before using
+-- them as parents for the next fan-out level.
+fanoutSettlementDelayMs :: Int
+fanoutSettlementDelayMs = 5000
 
 renderSubmitFailure :: TxSubmitResult -> String
 renderSubmitFailure = \case
@@ -872,8 +1102,11 @@ provisionRetryDelayMs :: Int
 provisionRetryDelayMs = 5000
 
 -- | A chain head must afford a good run of txs before it is worth adopting.
+-- The bid ceiling is mostly refunded; reserving 20 ceilings per head still
+-- leaves hundreds of realistically priced submissions while allowing the
+-- 10M-ADA demo fund to support the full 4096-head working set.
 chainFloorFeeMultiple :: Integer
-chainFloorFeeMultiple = 100
+chainFloorFeeMultiple = 20
 
 -- | Every UTxO currently at the fund's payment address, per the local node.
 -- The genesis pseudo-input keeps the anchor's witness; everything else is a
@@ -1288,6 +1521,8 @@ data SubmitOutcome
     SubmitParentPending
   | -- | This chain is finished (build failure or retry exhaustion): drop it.
     SubmitChainDead !String
+  | -- | The cockpit replaced this demand generation while it was backpressured.
+    SubmitCancelled
 
 submitLaneTx
   :: LocalNodeConnectInfo
@@ -1306,6 +1541,7 @@ submitLaneTx connectInfo fee metadata delayMs fund step = attempt pendingParentB
     case outcome of
       SubmitAccepted next -> pure next
       SubmitChainDead err -> die err
+      SubmitCancelled -> die "internal error: an uncancellable submission was cancelled"
       SubmitParentPending
         | budget > 0 -> do
             threadDelay (pendingParentDelayMs * 1000)
@@ -1322,7 +1558,18 @@ submitLaneTxCatch
   -> SpendableFund
   -> (Int, Inclusion)
   -> IO SubmitOutcome
-submitLaneTxCatch connectInfo fee metadata delayMs fund (index, inclusion) =
+submitLaneTxCatch = submitLaneTxCatchWhile (pure True)
+
+submitLaneTxCatchWhile
+  :: IO Bool
+  -> LocalNodeConnectInfo
+  -> Coin
+  -> TxMetadataInEra DijkstraEra
+  -> Int
+  -> SpendableFund
+  -> (Int, Inclusion)
+  -> IO SubmitOutcome
+submitLaneTxCatchWhile stillCurrent connectInfo fee metadata delayMs fund (index, inclusion) =
   case buildLaneTx connectInfo fee metadata fund inclusion of
     Left err ->
       pure $ SubmitChainDead $ "Failed to build tx " <> show index <> ": " <> err
@@ -1333,26 +1580,30 @@ submitLaneTxCatch connectInfo fee metadata delayMs fund (index, inclusion) =
     -- so we wait and resubmit the very same transaction (the chain is fixed)
     -- rather than giving up. A finite budget still backstops a stuck chain.
     submitWithBackpressure attemptsLeft tx nextFund = do
-      result <- submitTxToNodeLocal connectInfo (TxInMode ShelleyBasedEraDijkstra tx)
-      case result of
-        TxSubmitSuccess -> do
-          putStrLn $
-            show index
-              <> ": accepted "
-              <> renderInclusion inclusion
-              <> " "
-              <> show (getTxId (getTxBody tx))
-          pace delayMs
-          pure (SubmitAccepted nextFund)
-        TxSubmitFail err
-          | isPermanentRejection (show err) -> pure SubmitParentPending
-          | attemptsLeft > 0 -> retryAfterDrain attemptsLeft tx nextFund
-          | otherwise ->
-              pure $ SubmitChainDead $ show index <> ": rejected " <> renderInclusion inclusion <> ": " <> show err
-        TxSubmitError err
-          | attemptsLeft > 0 -> retryAfterDrain attemptsLeft tx nextFund
-          | otherwise ->
-              pure $ SubmitChainDead $ show index <> ": submit error " <> renderInclusion inclusion <> ": " <> show err
+      active <- stillCurrent
+      if not active
+        then pure SubmitCancelled
+        else do
+          result <- submitTxToNodeLocal connectInfo (TxInMode ShelleyBasedEraDijkstra tx)
+          case result of
+            TxSubmitSuccess -> do
+              putStrLn $
+                show index
+                  <> ": accepted "
+                  <> renderInclusion inclusion
+                  <> " "
+                  <> show (getTxId (getTxBody tx))
+              pace delayMs
+              pure (SubmitAccepted nextFund)
+            TxSubmitFail err
+              | isPermanentRejection (show err) -> pure SubmitParentPending
+              | attemptsLeft > 0 -> retryAfterDrain attemptsLeft tx nextFund
+              | otherwise ->
+                  pure $ SubmitChainDead $ show index <> ": rejected " <> renderInclusion inclusion <> ": " <> show err
+            TxSubmitError err
+              | attemptsLeft > 0 -> retryAfterDrain attemptsLeft tx nextFund
+              | otherwise ->
+                  pure $ SubmitChainDead $ show index <> ": submit error " <> renderInclusion inclusion <> ": " <> show err
 
     retryAfterDrain attemptsLeft tx nextFund = do
       pace (max submitRetryDelayMs delayMs)
@@ -1386,13 +1637,11 @@ pendingParentBudget = 36
 pendingParentDelayMs :: Int
 pendingParentDelayMs = 2000
 
--- | Per-chain stagger added to every park. Without it the lane's chains
--- all ride the same endorser block, wait out the same certificate and
--- resume as ONE HERD: the ranking block's fullness square-waves and the
--- urgent quote sawtooths with it. Spread across the fan-out this turns
--- the herd back into a crowd.
+-- | Small per-chain stagger added to every park. It spreads a 320-chain
+-- fan-out over less than two seconds, avoiding a synchronized retry burst
+-- without turning the chain index into a 48-second artificial outage.
 chainStaggerMs :: Int
-chainStaggerMs = 150
+chainStaggerMs = 5
 
 buildLaneTx
   :: LocalNodeConnectInfo
