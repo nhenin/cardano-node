@@ -39,8 +39,20 @@ let
         cp -r ${protoLensSrc}/google/protobuf/src $out/proto-lens-protobuf-types/proto-src
         chmod -R -w $out
       '';
+      workspaceLayout = builtins.pathExists ../../cardano-node/cabal.project;
     in {
-      src = ../.;
+      # The dynamic-pricing branch is also consumed as a submodule of a
+      # workspace whose sibling repositories are local Cabal packages. When
+      # the flake is opened from that workspace, keep the whole workspace in
+      # the Nix source instead of isolating cardano-node in the store.
+      src =
+        if workspaceLayout
+        then haskellLib.cleanSourceWith {
+          src = ../../.;
+          subDir = "cardano-node";
+          includeSiblings = true;
+        }
+        else ../.;
       name = "cardano-node";
       compiler-nix-name = lib.mkDefault (if pkgs.stdenv.hostPlatform.isWindows then windowsCompilerNixName else "ghc967");
       # Extra-compilers

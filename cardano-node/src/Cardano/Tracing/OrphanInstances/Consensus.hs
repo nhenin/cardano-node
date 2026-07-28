@@ -1587,7 +1587,9 @@ instance ( ToObject (ApplyTxErr blk), ToObject (GenTx blk)
           .= map
             ( \(tx, err) ->
                 Aeson.object $
-                  [ "tx" .= toObject verb (txForgetValidated tx)
+                  -- Preserve maximal error detail without serialising a
+                  -- transaction's full metadata payload into every removal.
+                  [ "tx" .= toObject NormalVerbosity (txForgetValidated tx)
                   ] <>
                   [ "err" .= toObject verb err
                   | verb == MaximalVerbosity

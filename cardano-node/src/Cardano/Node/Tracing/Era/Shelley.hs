@@ -4,11 +4,13 @@
 {-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
@@ -37,7 +39,10 @@ import           Cardano.Ledger.Chain
 import           Cardano.Ledger.Conway.Governance (govActionIdToText)
 import qualified Cardano.Ledger.Conway.Rules as Conway
 import qualified Cardano.Ledger.Core as Ledger
+import           Cardano.Ledger.Dijkstra (DijkstraEra)
 import qualified Cardano.Ledger.Dijkstra.Rules as Dijkstra
+import           Cardano.Ledger.Dijkstra.TxBody (DijkstraEraTxBody (..))
+import           Cardano.Ledger.DynamicPricing.InclusionStrategy (Inclusion (..))
 import qualified Cardano.Ledger.Hashes as Hashes
 import           Cardano.Ledger.Shelley.API
 import           Cardano.Ledger.Shelley.Rules
@@ -81,6 +86,9 @@ import qualified Data.Set as Set
 import qualified Data.Set.NonEmpty as NonEmptySet
 import           Data.Text (Text)
 import qualified Data.Text.Encoding as Text
+import qualified Data.Typeable as Typeable
+import           Data.Type.Equality ((:~:) (Refl))
+import           Lens.Micro ((^.))
 
 {- HLINT ignore "Use :" -}
 
@@ -90,13 +98,33 @@ import qualified Data.Text.Encoding as Text
 -- NOTE: this list is sorted in roughly topological order.
 
 instance
+  forall protocol era.
   ( ToJSON (SupportsMempool.TxId (GenTx (ShelleyBlock protocol era)))
   , ShelleyBasedEra era
   ) => LogFormatting (GenTx (ShelleyBlock protocol era)) where
   forMachine dtal tx =
     mconcat $
-        ( "txid" .= txId tx )
-      : [ "tx"   .= condense tx | dtal == DDetailed ]
+        [ "txid" .= txId tx ]
+      <> dijkstraTraceFields tx
+      <> [ "tx" .= condense tx | dtal == DDetailed ]
+   where
+    dijkstraTraceFields :: GenTx (ShelleyBlock protocol era) -> [Aeson.Object]
+    dijkstraTraceFields genTx =
+      case Typeable.eqT @era @DijkstraEra of
+        Just Refl ->
+          case genTx of
+            Consensus.ShelleyTx _ ledgerTx ->
+              [ "lane" .=
+                  case ledgerTx ^. Ledger.bodyTxL . inclusionTxBodyL of
+                    Urgent -> String "urgent"
+                    Optimistic -> String "optimistic"
+              , "inputTxIds" .=
+                  [ parent
+                  | TxIn parent _ <-
+                      Set.toList (ledgerTx ^. Ledger.bodyTxL . Ledger.inputsTxBodyL)
+                  ]
+              ]
+        Nothing -> []
 
 instance LogFormatting (Set (Credential Staking)) where
   forMachine _dtal creds =

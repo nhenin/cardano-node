@@ -1132,7 +1132,11 @@ instance
           .= map
             ( \(tx, err) ->
                 Aeson.object $
-                  [ "tx" .= forMachine dtal (txForgetValidated tx)
+                  -- The detailed Dijkstra transaction includes its full
+                  -- metadata payload. Keep the removal reason detailed, but
+                  -- emit the transaction itself in the compact form consumed
+                  -- by the live projection (txid, lane and input txids).
+                  [ "tx" .= forMachine DNormal (txForgetValidated tx)
                   ] <>
                   [ "err" .= forMachine dtal err
                   | dtal >= DDetailed

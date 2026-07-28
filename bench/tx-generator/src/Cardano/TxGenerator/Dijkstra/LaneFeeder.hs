@@ -406,7 +406,11 @@ buildSplitTx ::
   Either String (Tx DijkstraEra, [SpendableFund], SpendableFund)
 buildSplitTx LocalNodeConnectInfo{localNodeNetworkId} (Coin bidLovelace) SpendableFund{spendTxIn, spendValue = Coin available, spendPaymentKey, spendWitness, spendFeeRefundAccount} = do
   let perTx = bidLovelace + independentPoolHeadroom
-      Coin splitFee = independentSplitFee
+      Coin minimumSplitFee = independentSplitFee
+      -- Provisioning must remain valid while the burst moves the live quote.
+      -- A fixed fee can be below the current quote after an earlier load test,
+      -- preventing the price-squeeze workload from starting at all.
+      splitFee = max minimumSplitFee (bidLovelace * 4)
       change = available - perTx * fromIntegral independentPoolSize - splitFee
   if change < 1000000
     then Left "insufficient funds to split the pool"
@@ -419,7 +423,7 @@ buildSplitTx LocalNodeConnectInfo{localNodeNetworkId} (Coin bidLovelace) Spendab
             defaultTxBodyContent ShelleyBasedEraDijkstra
               & setTxIns [(spendTxIn, BuildTxWith (KeyWitness KeyWitnessForSpending))]
               & setTxOuts (replicate independentPoolSize poolOutput <> [changeOutput])
-              & setTxFee (TxFeeExplicit ShelleyBasedEraDijkstra independentSplitFee)
+              & setTxFee (TxFeeExplicit ShelleyBasedEraDijkstra (Coin splitFee))
               & setTxValidityLowerBound TxValidityNoLowerBound
               & setTxValidityUpperBound (defaultTxValidityUpperBound ShelleyBasedEraDijkstra)
               & setTxMetadata TxMetadataNone
@@ -905,64 +909,113 @@ provisionLane connectInfo fanout feeLovelace laneName anchor = attempt provision
           pure (mkLaneChains base)
     if missing <= 0
       then settled
-      else case sortOn (Down . spendValue) base of
-        [] -> settled
-        biggest : _ -> do
-          fanoutResult <- submitFanoutTree connectInfo (missing + 1) biggest
-          case fanoutResult of
-            Right pieces -> do
-              putStrLn $
-                laneName
-                  <> " lane: provisioned "
-                  <> show (length pieces)
-                  <> " fan-out heads; waiting for "
-                  <> show fanout
-                  <> " confirmed chains"
-              confirmed <- awaitConfirmedFanout connectInfo minChain fanout anchor
-              case confirmed of
-                Just funds -> do
-                  putStrLn $
-                    laneName
-                      <> " lane: "
-                      <> show (length funds)
-                      <> " confirmed chains ready"
-                  pure (mkLaneChains funds)
-                Nothing
-                  | attemptsLeft > 1 -> do
-                      putStrLn $
-                        laneName
-                          <> " lane: fan-out confirmation was not stable; re-discovering in "
-                          <> show (provisionRetryDelayMs `div` 1000)
-                          <> "s"
-                      pauseMs provisionRetryDelayMs
-                      attempt (attemptsLeft - 1)
-                  | otherwise -> do
-                      putStrLn $
-                        laneName
-                          <> " lane: fan-out confirmation gave up; running on "
-                          <> show (length base)
-                          <> " confirmed chain(s)"
-                      pure (mkLaneChains base)
-            Left err
-              | attemptsLeft > 1 -> do
-                  putStrLn $
-                    laneName
-                      <> " lane: fan-out attempt failed ("
-                      <> err
-                      <> "), re-discovering in "
-                      <> show (provisionRetryDelayMs `div` 1000)
-                      <> "s"
-                  pauseMs provisionRetryDelayMs
-                  attempt (attemptsLeft - 1)
-              | otherwise -> do
-                  putStrLn $
-                    laneName
-                      <> " lane: fan-out gave up ("
-                      <> err
-                      <> "); running on "
-                      <> show (length base)
-                      <> " chain(s)"
-                  settled
+      else do
+        fanoutResult <- submitFanoutForest connectInfo minChain fanout base
+        case fanoutResult of
+          Right pieces -> do
+            putStrLn $
+              laneName
+                <> " lane: provisioned "
+                <> show (length pieces)
+                <> " fan-out heads; waiting for "
+                <> show fanout
+                <> " confirmed chains"
+            confirmed <- awaitConfirmedFanout connectInfo minChain fanout anchor
+            case confirmed of
+              Just funds -> do
+                putStrLn $
+                  laneName
+                    <> " lane: "
+                    <> show (length funds)
+                    <> " confirmed chains ready"
+                pure (mkLaneChains funds)
+              Nothing
+                | attemptsLeft > 1 -> do
+                    putStrLn $
+                      laneName
+                        <> " lane: fan-out confirmation was not stable; re-discovering in "
+                        <> show (provisionRetryDelayMs `div` 1000)
+                        <> "s"
+                    pauseMs provisionRetryDelayMs
+                    attempt (attemptsLeft - 1)
+                | otherwise -> do
+                    putStrLn $
+                      laneName
+                        <> " lane: fan-out confirmation gave up; running on "
+                        <> show (length base)
+                        <> " confirmed chain(s)"
+                    pure (mkLaneChains base)
+          Left err
+            | attemptsLeft > 1 -> do
+                putStrLn $
+                  laneName
+                    <> " lane: fan-out attempt failed ("
+                    <> err
+                    <> "), re-discovering in "
+                    <> show (provisionRetryDelayMs `div` 1000)
+                    <> "s"
+                pauseMs provisionRetryDelayMs
+                attempt (attemptsLeft - 1)
+            | otherwise -> do
+                putStrLn $
+                  laneName
+                    <> " lane: fan-out gave up ("
+                    <> err
+                    <> "); running on "
+                    <> show (length base)
+                    <> " chain(s)"
+                settled
+
+-- | Expand every re-adopted fund, not just the largest one, until the lane has
+-- its target number of heads. A partially successful previous attempt often
+-- leaves a dozen confirmed seed UTxOs. Splitting only one seed into all the
+-- missing heads makes each output too small for 'minChain', so confirmation
+-- can never converge. The plan below assigns each seed no more heads than its
+-- value can fund and preserves one head for every other seed.
+submitFanoutForest
+  :: LocalNodeConnectInfo
+  -> Coin
+  -> Int
+  -> [SpendableFund]
+  -> IO (Either String [SpendableFund])
+submitFanoutForest connectInfo (Coin minChain) target funds =
+  case plan target (sortOn (Down . spendValue) funds) of
+    Left err -> pure (Left err)
+    Right allocations -> submit allocations []
+ where
+  Coin splitFee = independentSplitFee
+  -- The largest possible tree pays one root split plus one split per 320-head
+  -- batch. Reserving that amount for every source is conservative for smaller
+  -- allocations and keeps every resulting head above the adoption threshold.
+  maxTreeFees =
+    splitFee
+      * fromIntegral (1 + (target + fanoutBatchSize - 1) `div` fanoutBatchSize)
+
+  capacity SpendableFund{spendValue = Coin available} =
+    max 1 . fromInteger $ max 0 (available - maxTreeFees) `div` minChain
+
+  plan 0 [] = Right []
+  plan remaining [] =
+    Left $
+      "re-adopted funds can provision only "
+        <> show (target - remaining)
+        <> "/"
+        <> show target
+        <> " funded heads"
+  plan remaining (fund : rest)
+    | remaining <= length rest =
+        Left "fan-out allocation would strand a re-adopted fund"
+    | otherwise =
+        let count = min (capacity fund) (remaining - length rest)
+         in ((fund, count) :) <$> plan (remaining - count) rest
+
+  submit [] acc = pure (Right acc)
+  submit ((fund, 1) : rest) acc = submit rest (fund : acc)
+  submit ((fund, count) : rest) acc = do
+    result <- submitFanoutTree connectInfo count fund
+    case result of
+      Left err -> pure (Left err)
+      Right pieces -> submit rest (pieces <> acc)
 
 -- | Provision more heads than fit in one transaction without exceeding the
 -- maximum transaction size: split the root into a few seeds, then split each
